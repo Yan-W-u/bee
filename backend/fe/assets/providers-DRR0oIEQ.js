@@ -1,0 +1,1 @@
+import{i as e}from"./index-Cl5G87Y9.js";var t={list:()=>e(`/v1/providers`),settings:()=>e(`/v1/settings`),info:()=>e(`/v1/info`)};export{t};

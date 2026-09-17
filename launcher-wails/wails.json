@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "Bee",
+  "outputfilename": "Bee.exe",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "Bee",
+    "email": "dev@bee.com"
+  },
+  "info": {
+    "companyName": "Bee",
+    "productName": "Bee - 蜜罐渗透测试平台",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2026 Bee",
+    "comments": "Built with Wails"
+  }
+}

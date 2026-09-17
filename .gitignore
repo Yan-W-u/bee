@@ -1,0 +1,32 @@
+﻿# Build outputs
+dist/
+downloads/
+*.exe
+*.dll
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
+# Runtime data (DB, logs, keys, installation secrets)
+data/
+
+# Backend
+backend/bin/
+backend/tmp/
+
+# Environment
+.env
+*.local
+
+# IDE / OS
+.idea/
+.vscode/
+*.suo
+*.user
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
