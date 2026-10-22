@@ -1,0 +1,70 @@
+name: bee 全量周扫
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"  # 每周一 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  full-scan:
+    name: 全量扫描（含已进入基线的历史问题）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 全量扫描
+        env:
+          BEE_LLM_API_KEY: ${{ secrets.BEE_LLM_API_KEY }}
+          # 可选：开启 semgrep 后端补充规则覆盖
+          # 见 docs/ci.md「为什么建议同时开 semgrep」
+        run: |
+          python -m bee scan . --sarif bee-full.sarif --json > bee-full.json
+
+      - name: 上传 SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bee-full.sarif
+          category: bee-full
+
+      - name: 汇总
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          data = json.loads(pathlib.Path("bee-full.json").read_text(encoding="utf-8"))
+          by_sev = {}
+          for item in data:
+              by_sev[item["severity"]] = by_sev.get(item["severity"], 0) + 1
+          lines = ["## bee 全量扫描结果", "", f"总计 **{len(data)}** 条", ""]
+          for sev in ("ERROR", "WARNING", "INFO"):
+              if sev in by_sev:
+                  lines.append(f"- {sev}: {by_sev[sev]}")
+          pathlib.Path("summary.md").write_text("\n".join(lines), encoding="utf-8")
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+  self-check:
+    name: 自检（测试 + 规则 benchmark）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # 工具自身的健康度：规则改宽导致误报回来，或者补丁验证被改坏，
+      # 都在这里被拦住，而不是等到有人拿它扫真实项目才发现
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 规则 benchmark（有 FN/FP 则失败）
+        run: python benchmark/run.py --strict

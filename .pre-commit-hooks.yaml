@@ -1,0 +1,9 @@
+# 提交前扫一遍。只跑规则引擎，零依赖、毫秒级，不会拖慢提交。
+- id: bee
+  name: bee 安全扫描
+  description: 检测新增的注入、凭据泄露、不安全反序列化等问题
+  entry: python -m bee scan
+  language: python
+  pass_filenames: false
+  always_run: true
+  args: [".", "--min-severity", "error"]

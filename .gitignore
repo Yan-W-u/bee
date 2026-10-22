@@ -5,7 +5,9 @@ build/
 dist/
 .venv/
 venv/
-.vulnfix.bak
-*.vulnfix.bak
+*.bee.bak
 orders.db
 .pytest_cache/
+.bee-baseline.json
+bee.sarif
+_e2e/

@@ -83,7 +83,8 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-22"],
         owasp=["A01:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php"],
-        pattern=r"""(?is)(?:open|readFile|readFileSync|createReadStream|send_file|sendFile|ioutil\.ReadFile|os\.ReadFile|FileInputStream)\s*\(\s*(?:os\.path\.join\s*\([^)]{0,200}\w|path\.join\s*\([^)]{0,200}\w|filepath\.Join\s*\([^)]{0,200}\w)[^)]{0,200}\)?""",
+        # 两条分支：join 系列，以及「绝对路径字面量 + 变量」的直接拼接
+        pattern=r"""(?is)(?:(?:open|readFile|readFileSync|createReadStream|send_file|sendFile|ioutil\.ReadFile|os\.ReadFile|FileInputStream)\s*\(\s*(?:os\.path\.join|path\.join|filepath\.Join)\s*\([^)]{0,200}\w[^)]{0,200}\)?|(?:open|readFile|readFileSync)\s*\(\s*f?["'][^"'\n]{0,160}/["']\s*\+)""",
         safe_when=[
             r"(?i)secure_filename|\bbasename\b|\brealpath\b|\bResolve\b.*\bHasPrefix\b|\bcommonpath\b|\bfromfilepath\b",
         ],
@@ -100,7 +101,8 @@ BUILTIN_RULES: list[Rule] = _r(
         owasp=["A07:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php", "yaml", "json", "env"],
         # 用零宽后视而不是 [^A-Za-z0-9]：后者会吞掉换行符，导致行号整体偏移 1。
-        pattern=r"""(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9_.]*)(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_]*\s*(?<![=!<>])=(?!=)\s*["'][^"'\s]{6,}["']""",
+        # 分隔符要同时支持 = 和 :，否则 YAML / JSON 配置里的 password: "xxx" 会漏掉。
+        pattern=r"""(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9_.]*)(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_]*\s*(?<![=!<>])[:=](?!=)\s*["'][^"'\s]{6,}["']""",
         safe_when=[
             r"(?i)(?:os\.getenv|os\.environ|process\.env|getenv\(|env::var|\$\{|<[a-z_-]+>|xxx+|YOUR_|PLACEHOLDER|CHANGE_?ME|example|dummy|test|sample|your-|\*\*\*)",
         ],
@@ -128,8 +130,10 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-94", "CWE-95"],
         owasp=["A03:2021"],
         languages=["python", "javascript", "typescript", "php"],
-        pattern=r"""(?is)\b(?:eval|exec|execfile|compile|new\s+Function|Function\s*\(|setTimeout\s*\(\s*["'`]|assert\s*\()\s*\(\s*(?:f["']|[^)]{0,120}(?:\+|request\.|input\(|\$\{))""",
-        safe_when=[r"(?i)ast\.literal_eval|json\.parse"],
+        # 裸 eval(变量) 本身就是高危，不该要求它必须伴随字符串拼接。
+        # 只排除 literal_eval 与无参的 model.eval()。
+        pattern=r"""(?is)\b(?:eval|exec|execfile)\s*\(|(?:\bnew\s+Function|Function)\s*\(|setTimeout\s*\(\s*["'`]""",
+        safe_when=[r"(?i)ast\.literal_eval|json\.parse|\.eval\s*\(\s*\)"],
         root_cause_hint="字符串被当作代码解析执行，一旦内容可被外部影响，就等于把解释器交给了攻击者。",
         fix_hint="用显式映射表或 AST 白名单替代动态求值；确实需要表达式时用 literal_eval / 受限解析器。",
         references=["https://cwe.mitre.org/data/definitions/94.html"],
@@ -154,7 +158,7 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-327", "CWE-328"],
         owasp=["A02:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php"],
-        pattern=r"""(?is)\b(?:hashlib\.(?:md5|sha1)|MessageDigest\.getInstance\s*\(\s*["'](?:MD5|SHA-?1)|createHash\s*\(\s*["'](?:md5|sha1)|crypto\.(?:MD5|SHA1)|md5\.New|crypto\.createHash\s*\(\s*["']md5)""",
+        pattern=r"""(?is)\b(?:hashlib\.(?:md5|sha1)|MessageDigest\.getInstance\s*\(\s*["'](?:MD5|SHA-?1)|createHash\s*\(\s*["'](?:md5|sha1)|crypto\.(?:MD5|SHA1)|(?:md5|sha1)\.(?:New|Sum)|crypto\.createHash\s*\(\s*["']md5)""",
         safe_when=[],
         root_cause_hint="MD5/SHA-1 已被证明存在实用碰撞攻击，不能用于完整性校验或凭据存储。",
         fix_hint="换 SHA-256 及以上；口令存储用 bcrypt/scrypt/argon2 而非任何裸哈希。",
@@ -180,7 +184,7 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-79"],
         owasp=["A03:2021"],
         languages=["javascript", "typescript", "python", "php", "java"],
-        pattern=r"""(?is)(?:innerHTML\s*=|document\.write\s*\(|dangerouslySetInnerHTML|\.html\s*\(\s*[^)\s]*(?:\+|\$\{)|render_template_string\s*\(|Markup\s*\()""",
+        pattern=r"""(?is)(?:innerHTML\s*=|document\.write\s*\(|dangerouslySetInnerHTML|\.html\s*\(\s*[^)\s]*(?:\+|\$\{))""",
         safe_when=[r"(?i)DOMPurify|sanitize|escape\(|escapeHtml|textContent\s*="],
         root_cause_hint="未经转义的数据被当作 HTML 解释，浏览器无法区分内容与标记。",
         fix_hint="改用 textContent / 模板自动转义；必须渲染富文本时用 DOMPurify 等白名单净化。",
@@ -211,6 +215,250 @@ BUILTIN_RULES: list[Rule] = _r(
         root_cause_hint="调试模式会暴露堆栈、配置与交互式调试器，等于给攻击者一个内置的后门入口。",
         fix_hint="从环境变量读取 debug 开关，默认 False；生产部署显式关闭。",
         references=["https://cwe.mitre.org/data/definitions/489.html"],
+    ),
+    # ---------------------------------------------------------- 第二批规则
+    # 原则：宁可窄也不误报。误报会浪费一整轮 LLM 重试，还会让人不再信任报告。
+    Rule(
+        id="bee.dynamic-order-by",
+        title="ORDER BY / 列名由外部输入决定（参数化无法防御）",
+        severity=Severity.ERROR,
+        cwe=["CWE-89"],
+        owasp=["A03:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:\border\s+by\b[^;]{0,80}(?:\+\s*\w|\$\{|\{\w*\}|%s["']?\s*%|\|\|)|["']\s*\+\s*\w+\s*\+\s*["']\s*(?:asc|desc|limit))""",
+        safe_when=[r"(?i)ORDER_BY_SAFE|allowed_sort|SAFE_COLUMNS|whitelist|allowlist"],
+        root_cause_hint="列名和排序方向属于 SQL 语法结构，不能用参数占位符表达，一旦可被外部输入改变就等于把排序子句交给了攻击者。",
+        fix_hint="用白名单映射：外部传入的字段名先查表，映射到固定的列名字面量，查不到就用默认列。",
+        references=["https://cwe.mitre.org/data/definitions/89.html"],
+    ),
+    Rule(
+        id="bee.ssti",
+        title="服务端模板注入（SSTI）",
+        severity=Severity.ERROR,
+        cwe=["CWE-1336", "CWE-94"],
+        owasp=["A03:2021"],
+        languages=["python", "javascript", "typescript", "java", "php"],
+        pattern=r"""(?is)(?:render_template_string\s*\(|jinja2\.Template\s*\(|\bTemplate\s*\(\s*(?:f["']|[^)\n]{0,120}(?:\+|%\s*\w|\$\{))|Environment\s*\(\s*\)\.from_string|nunjucks\.renderString|handlebars\.compile\s*\(|Twig.*?createTemplate)""",
+        safe_when=[r"(?i)render_template\s*\(\s*[\"']|autoescape\s*=\s*True"],
+        root_cause_hint="模板引擎会把内容当作代码解析，用户可控的模板字符串等于允许对方在服务端执行表达式。",
+        fix_hint="渲染固定的模板文件，外部数据只作为上下文变量传入；确实需要动态模板时用沙箱环境并禁用危险过滤器。",
+        references=["https://cwe.mitre.org/data/definitions/1336.html"],
+    ),
+    Rule(
+        id="bee.nosql-injection",
+        title="NoSQL 注入（请求数据直接进查询条件）",
+        severity=Severity.ERROR,
+        cwe=["CWE-943"],
+        owasp=["A03:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)\b(?:find|find_one|findOne|update_one|updateOne|update_many|delete_one|deleteMany|aggregate)\s*\(\s*\{[^}]{0,240}(?:request\.(?:args|form|json|GET|POST)|req\.(?:body|query|params)|\$_GET|\$_POST)""",
+        safe_when=[r"(?i)\$eq|\$in.*query|isinstance\(.*(?:str|int)\)|typeof\s+\w+\s*===\s*['\"]string"],
+        root_cause_hint="把整个请求对象当作查询条件，攻击者可以塞入 $ne、$gt、$where 这类操作符改变查询语义，或触发服务端 JS 执行。",
+        fix_hint="只取明确的标量字段并校验类型，构造查询条件时不要展开整个请求体；禁用 $where。",
+        references=["https://cwe.mitre.org/data/definitions/943.html"],
+    ),
+    Rule(
+        id="bee.open-redirect",
+        title="开放重定向（跳转目标由外部输入决定）",
+        severity=Severity.WARNING,
+        cwe=["CWE-601"],
+        owasp=["A01:2021"],
+        languages=["python", "javascript", "typescript", "java", "php"],
+        pattern=r"""(?is)(?:\bredirect\s*\(\s*(?:request\.(?:args|form|values|GET)|req\.(?:query|body|params)|params\[|\$_GET)|sendRedirect\s*\(\s*(?:request\.|params)|res\.redirect\s*\(\s*(?:req\.|request\.))""",
+        safe_when=[r"(?i)allowed_hosts|ALLOWED_REDIRECT|url_has_allowed_host_and_scheme|is_safe_url|startswith\(\s*['\"]/['\"]"],
+        root_cause_hint="跳转目标直接取自请求参数，攻击者可以把链接伪装成你的域名，把用户导向钓鱼页。",
+        fix_hint="只允许站内相对路径，或用白名单校验目标域名；Django 用 url_has_allowed_host_and_scheme。",
+        references=["https://cwe.mitre.org/data/definitions/601.html"],
+    ),
+    Rule(
+        id="bee.csrf-disabled",
+        title="CSRF 保护被关闭",
+        severity=Severity.WARNING,
+        cwe=["CWE-352"],
+        owasp=["A01:2021"],
+        languages=["python", "javascript", "typescript", "java", "php"],
+        pattern=r"""(?is)(?:@csrf_exempt|WTF_CSRF_ENABLED\s*=\s*False|csrf_protect\s*=\s*False|\.csrf\s*\(\s*\)\s*\.disable|csrf\s*\(\s*\)\s*\.disable|csrf:\s*false|CsrfViewMiddleware)""",
+        safe_when=[r"(?i)csrf_token|X-CSRF-Token|SameSite=Lax|SameSite=Strict"],
+        root_cause_hint="关闭 CSRF 校验后，第三方站点可以借用户已登录的 Cookie 发起跨站请求，执行用户没打算做的操作。",
+        fix_hint="保留框架默认的 CSRF 保护；确实需要豁免的接口改用 Token 认证或校验 Origin/Referer。",
+        references=["https://cwe.mitre.org/data/definitions/352.html"],
+    ),
+    Rule(
+        id="bee.cors-wildcard",
+        title="CORS 允许任意来源",
+        severity=Severity.WARNING,
+        cwe=["CWE-942"],
+        owasp=["A05:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:Access-Control-Allow-Origin["']?\s*[:,]\s*["']\*["']|allow_origins\s*=\s*\[\s*["']\*["']|origin\s*:\s*["']\*["']|addAllowedOrigin\s*\(\s*["']\*["']|CORS_ORIGIN_ALLOW_ALL\s*=\s*True)""",
+        safe_when=[r"(?i)allow_credentials\s*[:=]\s*(?:False|false)|supports_credentials\s*=\s*False"],
+        root_cause_hint="通配来源让任何站点都能读取接口响应；如果同时允许携带 Cookie，等于把登录态借给了任意第三方页面。",
+        fix_hint="改为固定来源白名单；绝不能同时开启 allow_credentials 与通配来源。",
+        references=["https://cwe.mitre.org/data/definitions/942.html"],
+    ),
+    Rule(
+        id="bee.jwt-verify-disabled",
+        title="JWT 签名校验被关闭",
+        severity=Severity.ERROR,
+        cwe=["CWE-347"],
+        owasp=["A02:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:verify_signature["']?\s*[:=]\s*(?:False|false)|jwt\.decode\s*\([^)]{0,200}verify\s*=\s*False|JWT\.decode\s*\([^)]{0,200}verify\s*=\s*False|algorithms?\s*[:=]\s*\[\s*["']none["']|\.setSigningKey\s*\(\s*["']["']\s*\))""",
+        safe_when=[r"(?i)algorithms?\s*=\s*\[\s*[\"'](?:RS256|HS256|ES256)"],
+        root_cause_hint="不校验签名时，任何人都能自己造一个包含任意身份的 JWT，鉴权形同虚设。",
+        fix_hint="强制校验签名并显式指定允许的算法（如 RS256），拒绝 none 算法。",
+        references=["https://cwe.mitre.org/data/definitions/347.html"],
+    ),
+    Rule(
+        id="bee.redos",
+        title="正则表达式拒绝服务（嵌套量词）",
+        severity=Severity.WARNING,
+        cwe=["CWE-1333"],
+        owasp=["A05:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)\b(?:re\.(?:compile|match|search|fullmatch|sub)|new\s+RegExp|RegExp\s*\()\s*\(?\s*["'][^"'\n]{0,200}(?:\([^)\n]{0,40}[+*]\)[+*]|\.\*[^"']{0,40}\.\*|\[[^\]]{0,40}\][+*][^\n]{0,10}[+*])""",
+        safe_when=[r"(?i)re2|RE2|re\.escape|timeout\s*="],
+        root_cause_hint="嵌套或重叠量词会让回溯时间随输入长度指数增长，攻击者用一个精心构造的长字符串就能占满 CPU。",
+        fix_hint="改写正则消除歧义（避免 (a+)+ 这类结构），或改用 RE2 这类无回溯引擎，并给匹配设置超时。",
+        references=["https://cwe.mitre.org/data/definitions/1333.html"],
+    ),
+    Rule(
+        id="bee.zip-slip",
+        title="压缩包解压未校验路径（Zip Slip）",
+        severity=Severity.ERROR,
+        cwe=["CWE-22"],
+        owasp=["A01:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:\.extractall\s*\(|\.extract\s*\(\s*[^)\n]{0,100}(?:member|name|filename|entry)|tarfile\.(?:open|extractall)|ZipFile\s*\([^)]*\)\s*\.\s*extract)""",
+        safe_when=[r"(?i)realpath|commonpath|is_relative_to|secure_|basename|resolve\(\).*startswith"],
+        root_cause_hint="压缩包内的条目名可以包含 ../，直接解压会把文件写到目标目录之外，覆盖任意可写路径。",
+        fix_hint="解压前把条目的规范化绝对路径与目标根目录做前缀比较，越界就拒绝。",
+        references=["https://cwe.mitre.org/data/definitions/22.html"],
+    ),
+    Rule(
+        id="bee.private-key-hardcoded",
+        title="私钥硬编码在源码中",
+        severity=Severity.ERROR,
+        cwe=["CWE-321"],
+        owasp=["A02:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php", "yaml", "json", "env"],
+        pattern=r"""-----BEGIN (?:RSA |EC |DSA |OPENSSH |PGP )?PRIVATE KEY-----""",
+        safe_when=[r"(?i)test|example|dummy|fixture|sample"],
+        root_cause_hint="私钥随源码进入版本库和镜像，任何拿到代码的人都能签发或解密，且轮换成本极高。",
+        fix_hint="把私钥移到密钥管理服务或部署时挂载的文件，源码里只留路径；同时在密钥系统里轮换这把已泄露的私钥。",
+        references=["https://cwe.mitre.org/data/definitions/321.html"],
+    ),
+    Rule(
+        id="bee.cloud-credential",
+        title="云平台访问密钥硬编码",
+        severity=Severity.ERROR,
+        cwe=["CWE-798"],
+        owasp=["A07:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php", "yaml", "json", "env"],
+        pattern=r"""(?<![A-Z0-9])(?:AKIA|ASIA)[0-9A-Z]{16}(?![A-Z0-9])""",
+        safe_when=[r"(?i)example|dummy|test|sample|xxx|AKIAIOSFODNN7EXAMPLE"],
+        root_cause_hint="长期访问密钥写死在代码里，泄露后攻击者可直接以该 IAM 身份操作云资源，且默认不会过期。",
+        fix_hint="改用实例角色或 OIDC 临时凭证；如果这是真实密钥，先在云平台禁用它再改代码。",
+        references=["https://cwe.mitre.org/data/definitions/798.html"],
+    ),
+    Rule(
+        id="bee.sensitive-data-logging",
+        title="敏感字段被写入日志",
+        severity=Severity.WARNING,
+        cwe=["CWE-532"],
+        owasp=["A09:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:logger?\.(?:info|warning|error|debug|critical|exception)|log\.(?:info|warn|error|debug)|console\.log|print)\s*\([^)\n]{0,200}\b(?:password|passwd|secret|token|api_?key|credential|private_key|card_?number|ssn)\b""",
+        safe_when=[r"(?i)mask|redact|\*\*\*|hash|fingerprint|last4|\[REDACTED\]"],
+        root_cause_hint="日志会被采集到集中平台，访问权限通常远大于业务数据本身，凭据一旦进日志就等于扩大了泄露面。",
+        fix_hint="记录前脱敏（只留后四位或哈希），或直接不打敏感字段。",
+        references=["https://cwe.mitre.org/data/definitions/532.html"],
+    ),
+    Rule(
+        id="bee.insecure-cookie",
+        title="Cookie 缺少安全属性",
+        severity=Severity.WARNING,
+        cwe=["CWE-614", "CWE-1004"],
+        owasp=["A05:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:set_cookie\s*\([^)\n]{0,300}(?:httponly\s*=\s*False|secure\s*=\s*False|samesite\s*=\s*["']?none)|res\.cookie\s*\([^)\n]{0,300}(?:httpOnly\s*:\s*false|secure\s*:\s*false|sameSite\s*:\s*["']none))""",
+        safe_when=[],
+        root_cause_hint="缺少 HttpOnly 时脚本能读到 Cookie，缺少 Secure 时明文请求也会带上它，SameSite=None 则允许跨站携带。",
+        fix_hint="会话 Cookie 一律 HttpOnly + Secure + SameSite=Lax（或 Strict）。",
+        references=["https://cwe.mitre.org/data/definitions/614.html"],
+    ),
+    Rule(
+        id="bee.unrestricted-upload",
+        title="文件上传未限制类型与路径",
+        severity=Severity.WARNING,
+        cwe=["CWE-434"],
+        owasp=["A04:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)(?:\.save\s*\(\s*(?:os\.path\.join\s*\([^)]{0,120}(?:filename|request\.files|file\.name)|request\.files\[[^\]]*\]\[?["']?filename)|move_uploaded_file\s*\(|transferTo\s*\()""",
+        safe_when=[r"(?i)secure_filename|ALLOWED_EXT|allowed_extensions|mimetype.*in|content_type.*in"],
+        root_cause_hint="直接使用客户端提供的文件名和类型，攻击者可以上传可执行脚本到 Web 可访问目录，进而拿到服务器权限。",
+        fix_hint="用服务端生成的文件名，白名单校验扩展名与 MIME，把上传目录放到 Web 根目录之外。",
+        references=["https://cwe.mitre.org/data/definitions/434.html"],
+    ),
+    Rule(
+        id="bee.prototype-pollution",
+        title="原型链污染（外部数据合并进对象）",
+        severity=Severity.ERROR,
+        cwe=["CWE-1321"],
+        owasp=["A08:2021"],
+        languages=["javascript", "typescript"],
+        pattern=r"""(?is)(?:\[["']__proto__["']\]|\.__proto__\s*=(?!=)|\b(?:merge|extend|defaultsDeep|deepMerge)\s*\(\s*\{\s*\}\s*,\s*(?:req\.|request\.|body)|Object\.assign\s*\(\s*[\w.]+\s*,\s*(?:req\.|request\.))""",
+        safe_when=[r"(?i)Object\.create\(null\)|hasOwnProperty|__proto__.*delete|JSON\.parse\(JSON\.stringify"],
+        root_cause_hint="递归合并时把 __proto__ 当成普通属性写入，会污染所有对象的原型，影响整个进程后续逻辑。",
+        fix_hint="合并前剔除 __proto__ / constructor / prototype 键，或用 Object.create(null) 作为目标对象。",
+        references=["https://cwe.mitre.org/data/definitions/1321.html"],
+    ),
+    Rule(
+        id="bee.timing-attack",
+        title="凭据比较未使用恒定时间算法",
+        severity=Severity.INFO,
+        cwe=["CWE-208"],
+        owasp=["A02:2021"],
+        languages=["python", "javascript", "typescript", "go", "java", "php"],
+        pattern=r"""(?is)if\s+(?:[\w.]*)(?:password|passwd|token|secret|hmac|digest|signature)[\w.]*\s*==\s*[\w.]+\s*:""",
+        safe_when=[r"(?i)compare_digest|timingSafeEqual|constant_time|hmac\.compare|secrets\.compare|crypto\.timingSafeEqual"],
+        root_cause_hint="字符串 == 会在首个不同字节处提前返回，攻击者可以通过响应时间差逐字节推断出正确值。",
+        fix_hint="改用 hmac.compare_digest / crypto.timingSafeEqual 这类恒定时间比较。",
+        references=["https://cwe.mitre.org/data/definitions/208.html"],
+    ),
+    Rule(
+        id="bee.ldap-injection",
+        title="LDAP 过滤器注入",
+        severity=Severity.ERROR,
+        cwe=["CWE-90"],
+        owasp=["A03:2021"],
+        languages=["python", "javascript", "typescript", "java", "php"],
+        pattern=r"""(?is)(?:search_filter\s*=\s*["'][^"']{0,160}\(\s*\w+\s*=\s*["']\s*\+|\bfilter\s*=\s*f["'][^"']{0,160}\(\s*\w+\s*=\s*\{|\(\s*uid\s*=\s*["']\s*\+)""",
+        safe_when=[r"(?i)escape_filter_chars|ldap_filter_escape|filter_format|re\.escape"],
+        root_cause_hint="LDAP 过滤器的元字符（* ( ) \\ |）没有转义，攻击者能改变过滤条件，绕过认证或枚举整个目录。",
+        fix_hint="对插入值做 RFC 4515 转义（escape_filter_chars / ldap_escape），不要拼接原始输入。",
+        references=["https://cwe.mitre.org/data/definitions/90.html"],
+    ),
+    Rule(
+        id="bee.xxe",
+        title="XML 外部实体注入（XXE）",
+        severity=Severity.ERROR,
+        cwe=["CWE-611"],
+        owasp=["A05:2021"],
+        languages=["python", "javascript", "typescript", "java", "php"],
+        # 三条分支：Python 的 XMLParser / lxml 解析、Java 的 DocumentBuilderFactory、
+        # PHP 的 libxml 相关开关与直接 loadXML
+        pattern=r"""(?is)(?:\b(?:etree\.XMLParser|XMLParser|lxml\.etree\.(?:fromstring|parse)|ElementTree\.parse|xml\.dom\.minidom\.parse(?:String)?)\s*\(|DocumentBuilderFactory\.newInstance\s*\(\s*\)|libxml_disable_entity_loader\s*\(\s*(?:false|0)\s*\)|setFeature\s*\(\s*["'][^"']*disallow-doctype-decl[^"']*["']\s*,\s*false\s*\)|(?:simplexml_load_string|DOMDocument\s*->\s*loadXML)\s*\()""",
+        safe_when=[
+            r"(?i)resolve_entities\s*=\s*False|no_network\s*=\s*True|forbid_dtd\s*=\s*True",
+            r"(?i)defusedxml|defused",
+            r"(?i)setFeature\s*\(\s*[\"'][^\"']*disallow-doctype-decl[^\"']*[\"']\s*,\s*true\s*\)|setFeature\s*\(\s*[\"'][^\"']*external-general-entities[^\"']*[\"']\s*,\s*false\s*\)",
+            r"(?i)LIBXML_NONET|LIBXML_NOENT\s*\|\s*LIBXML_NONET",
+            r"(?i)libxml_disable_entity_loader\s*\(\s*(?:true|1)\s*\)",
+        ],
+        root_cause_hint="XML 解析器默认允许 DTD 与外部实体，攻击者可以用 SYSTEM 实体读取本地文件、发起 SSRF 或造成拒绝服务（实体膨胀）。",
+        fix_hint="禁用 DTD 与外部实体：Python 用 defusedxml 或 XMLParser(resolve_entities=False, no_network=True)；Java 给 DocumentBuilderFactory 设置 disallow-doctype-decl=true 并关闭 external entities；PHP 解析时加 LIBXML_NONET 且不开 LIBXML_NOENT。",
+        references=["https://cwe.mitre.org/data/definitions/611.html"],
     ),
 )
 
@@ -294,11 +542,15 @@ SQL_KEYWORD_RE = re.compile(
     r"(?is)\b(?:select\b.{0,300}?\bfrom\b|insert\s+into\b|update\s+\w+\s+set\b|"
     r"delete\s+from\b|drop\s+table\b|truncate\s+table\b)"
 )
-# 字符串被外部数据拼接/插值的信号
+# 字符串被外部数据拼接/插值的信号。PHP 用 . 拼接，不能只认 +
 CONCAT_SIGNAL_RE = re.compile(
-    r"""(?:["'`]\s*\+\s*\w)|(?:\w\s*\+\s*["'`])|(?:%\s*[\(\w])|(?:\.format\s*\()|(?:\bf["'])|(?:\$\{)"""
+    r"""(?:["'`]\s*\+\s*\w)|(?:\w\s*\+\s*["'`])|(?:%\s*[\(\w])|(?:\.format\s*\()|(?:\bf["'])|(?:\$\{)|(?:["'`]\s*\.\s*\$)|(?:["'`]\s*\.\s*\(?\$?[A-Za-z_]\w*\s*\()"""
 )
-ASSIGN_RE = re.compile(r"(?m)^[ \t]*([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*=\s*(.+)$", re.S)
+# 单行赋值。不用 re.S：逻辑行内部可能包含整段函数体，
+# 用 .+ 跨行会把后续语句一起吞进 rhs，反而误判拼接信号。
+ASSIGN_RE = re.compile(
+    r"(?m)^[ \t]*(?:my\s+)?([$@]?[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*=[ \t]*([^\n]*)"
+)
 
 
 def _split_call_args(text: str, open_idx: int) -> list[str]:
@@ -372,25 +624,27 @@ def _detect_sql_flow(text: str, rel: str) -> list[Finding]:
     assigned: dict[str, tuple[int, str]] = {}
 
     for line_no, chunk in _logical_lines(text):
-        m = ASSIGN_RE.match(chunk)
-        if not m:
-            continue
-        var, rhs = m.group(1), m.group(2)
-        if not SQL_KEYWORD_RE.search(rhs):
-            continue
-        if not CONCAT_SIGNAL_RE.search(rhs):
-            continue
-        # 参数化写法已在右侧显式分离，不算注入
-        if re.search(r"(?i)\?\s*,\s*\(|%s\s*\)\s*,\s*\(|:\w+\s*,", rhs):
-            continue
-        assigned[var.split(".")[-1]] = (line_no, rhs)
+        for m in ASSIGN_RE.finditer(chunk):
+            var, rhs = m.group(1), m.group(2)
+            actual_line = line_no + chunk.count("\n", 0, m.start())
+            if not SQL_KEYWORD_RE.search(rhs):
+                continue
+            if not CONCAT_SIGNAL_RE.search(rhs):
+                continue
+            # 参数化写法已在右侧显式分离，不算注入
+            if re.search(r"(?i)\?\s*,\s*\(|%s\s*\)\s*,\s*\(|:\w+\s*,", rhs):
+                continue
+            assigned[var.split(".")[-1]] = (actual_line, rhs)
 
     if not assigned:
         return findings
 
     for var, (line_no, rhs) in assigned.items():
+        # 不用 \b：mysqli_query / db.query 里 query 前是下划线或点，
+        # \b 在 _ 和 q 之间不成立，会整条漏掉
         sink = re.search(
-            rf"(?is)\b(?:execute|executemany|executescript|query|raw)\s*\(\s*{re.escape(var)}\s*[,)]",
+            rf"(?is)(?<![A-Za-z0-9])(?:execute|executemany|executescript|query|raw)\s*\([^;]{{0,240}}?"
+            rf"(?<![A-Za-z0-9_]){re.escape(var)}(?![A-Za-z0-9_])",
             text,
         )
         if not sink:
@@ -407,6 +661,10 @@ def _detect_sql_flow(text: str, rel: str) -> list[Finding]:
                 owasp=["A03:2021"],
                 references=["https://cwe.mitre.org/data/definitions/89.html"],
                 snippet="\n".join(text.splitlines()[max(0, line_no - 3): line_no + 3]),
+                code_line=(
+                    text.splitlines()[line_no - 1].strip()
+                    if 0 < line_no <= len(text.splitlines()) else ""
+                ),
                 detector="bee-flow",
                 raw={
                     "title": "SQL 注入（字符串拼接构造查询）",
@@ -498,6 +756,7 @@ def scan_file(path: Path, root: Path, rules: list[Rule] | None = None) -> list[F
             if rule.id == "bee.sql-injection" and _is_parameterized_sql_call(text, m.start()):
                 continue
             seen_lines.add(start_line)
+            code_line = source_lines[start_line - 1].strip() if 0 < start_line <= len(source_lines) else ""
             findings.append(
                 Finding(
                     rule_id=rule.id,
@@ -510,6 +769,7 @@ def scan_file(path: Path, root: Path, rules: list[Rule] | None = None) -> list[F
                     owasp=list(rule.owasp),
                     references=list(rule.references),
                     snippet=_snippet(text, start_line, context=3),
+                    code_line=code_line,
                     detector="bee-rules",
                     raw={"title": rule.title, "root_cause_hint": rule.root_cause_hint,
                          "fix_hint": rule.fix_hint, "matched": m.group(0)[:400]},
@@ -549,6 +809,30 @@ def scan_tree(
     # 同文件同规则相邻行合并噪音
     findings.sort(key=lambda x: (x.path, x.start_line, x.rule_id))
     return findings
+
+
+def merge_findings(primary: list[Finding], secondary: list[Finding]) -> list[Finding]:
+    """合并两个后端的检测结果。
+
+    同一位置两个后端都报了，只留一条：优先严重级别高的，
+    同级时优先保留带污点路径的（信息更多，可解释性更好）。
+    不做这层合并，报告里同一行会出现两遍，评审时很碍事。
+    """
+    rank = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}
+    best: dict[tuple[str, int], Finding] = {}
+
+    for finding in list(primary) + list(secondary):
+        key = (finding.path, finding.start_line)
+        current = best.get(key)
+        if current is None:
+            best[key] = finding
+            continue
+        if rank[finding.severity] > rank[current.severity]:
+            best[key] = finding
+        elif rank[finding.severity] == rank[current.severity] and finding.trace and not current.trace:
+            best[key] = finding
+
+    return sorted(best.values(), key=lambda x: (x.path, x.start_line, x.rule_id))
 
 
 def load_custom_rules(path: Path) -> list[Rule]:

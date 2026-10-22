@@ -7,15 +7,40 @@ import json
 import sys
 from pathlib import Path
 
-from .detect import BUILTIN_RULES, iter_source_files, load_custom_rules, scan_tree
+from . import __version__, baseline, sarif
+from .detect import BUILTIN_RULES, iter_source_files, load_custom_rules, merge_findings, scan_tree
 from .explain import explain
 from .llm import LLMClient, LLMConfig
-from .models import RepairResult, Severity
+from .models import Finding, RepairResult, Severity
 from .patch import repair_finding
 from .report import render_console, render_report, write_report
 from .verify import PatchSession, apply_session, finding_still_present
 
 SEV_ORDER = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}
+
+
+def _finding_dict(f: Finding) -> dict:
+    payload = {
+        "rule_id": f.rule_id,
+        "severity": f.severity.value,
+        "message": f.message,
+        "path": f.path,
+        "start_line": f.start_line,
+        "end_line": f.end_line,
+        "cwe": f.cwe,
+        "owasp": f.owasp,
+        "references": f.references,
+        "detector": f.detector,
+        "fingerprint": f.fingerprint,
+        "code_line": f.code_line,
+        "snippet": f.snippet,
+    }
+    if f.trace:
+        payload["trace"] = [
+            {"label": t.label, "path": t.path, "line": t.line, "content": t.content}
+            for t in f.trace
+        ]
+    return payload
 
 
 def _progress(msg: str) -> None:
@@ -49,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--include", action="append", help="只扫描匹配的 glob，如 'src/**/*.py'")
         sp.add_argument("--exclude", action="append", default=[], help="排除匹配的 glob")
         sp.add_argument("--limit", type=int, default=0, help="最多处理 N 条发现")
+        sp.add_argument("--detector", choices=["auto", "rules", "semgrep", "both"], default="auto",
+                        help="检测后端：rules=内置规则，semgrep=外部引擎，both=合并，auto=有 semgrep 就合并")
+        sp.add_argument("--semgrep-config", default="auto",
+                        help="semgrep 规则集，默认 auto（registry），也可传本地规则目录")
+        sp.add_argument("--baseline", type=Path, help="只报告相对该基线新增的问题")
+        sp.add_argument("--write-baseline", type=Path, help="把当前结果写成基线文件")
+        sp.add_argument("--fail-on-new", action="store_true",
+                        help="存在基线之外的新问题时以退出码 1 结束（供 CI 使用）")
+        sp.add_argument("--sarif", type=Path, help="额外输出 SARIF 2.1.0 供 GitHub Code Scanning 使用")
         sp.add_argument("--llm-base-url", default=None)
         sp.add_argument("--llm-key", default=None)
         sp.add_argument("--llm-model", default=None)
@@ -82,6 +116,40 @@ def _collect_targets(target: Path, include: list[str] | None, exclude: list[str]
     return files
 
 
+def _detect_all(root: Path, rules: list[Rule], args: argparse.Namespace) -> tuple[list[Finding], list[str]]:
+    """按选定的后端收集发现，返回 (findings, 说明)。"""
+    from . import semgrep_backend
+
+    mode = getattr(args, "detector", "auto")
+    config = getattr(args, "semgrep_config", "auto") or "auto"
+    notes: list[str] = []
+
+    if mode == "semgrep":
+        found, note = semgrep_backend.scan(root, config=config)
+        notes.append(note)
+        if not found:
+            notes.append(semgrep_backend.install_hint())
+        return found, notes
+
+    rule_findings = scan_tree(root, rules)
+
+    if mode == "rules":
+        return rule_findings, ["内置规则引擎"]
+
+    found, note = semgrep_backend.scan(root, config=config)
+    notes.append(note)
+    if not found:
+        if mode == "semgrep":
+            notes.append(semgrep_backend.install_hint())
+        elif mode == "both":
+            notes.append("semgrep 未产出结果，本次仅使用内置规则")
+        return rule_findings, notes
+
+    notes.append(f"合并后共 {len(merge_findings(rule_findings, found))} 条（去重前 "
+                 f"{len(rule_findings)} + {len(found)}）")
+    return merge_findings(rule_findings, found), notes
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     target = Path(args.target).resolve()
     if not target.exists():
@@ -89,28 +157,61 @@ def cmd_scan(args: argparse.Namespace) -> int:
         return 2
 
     rules = _select_rules(args.rule, args.rules_file)
+    root = target if target.is_dir() else target.parent
     files = _collect_targets(target, args.include, args.exclude)
-    findings = scan_tree(target if target.is_dir() else target.parent, rules)
+
+    findings, notes = _detect_all(root, rules, args)
+    for note in notes:
+        _progress(f"检测后端：{note}")
 
     if target.is_file():
         name = target.name
-        findings = [f for f in findings if f.path.endswith(name)]
+        findings = [f for f in findings if f.path == name or f.path.endswith("/" + name)]
 
-    findings = [f for f in findings if SEV_ORDER[f.severity] >= SEV_ORDER[Severity(args.min_severity.upper())]]
+    findings = [
+        f for f in findings
+        if SEV_ORDER[f.severity] >= SEV_ORDER[Severity(args.min_severity.upper())]
+    ]
+
+    baseline_obj = None
+    report_findings = findings
+    known: list[Finding] = []
+    if args.baseline:
+        baseline_obj = baseline.load(args.baseline)
+        report_findings, known = baseline.split(findings, baseline_obj)
+        _progress(
+            f"基线：{baseline.summary(baseline_obj)}；"
+            f"本次已存在 {len(known)} 条，新增 {len(report_findings)} 条"
+        )
+
     if args.limit:
-        findings = findings[: args.limit]
+        report_findings = report_findings[: args.limit]
 
     if args.json:
-        print(json.dumps([f.__dict__ | {"severity": f.severity.value} for f in findings],
-                         ensure_ascii=False, indent=2, default=str))
+        print(json.dumps([_finding_dict(f) for f in report_findings], ensure_ascii=False, indent=2))
     else:
-        if not findings:
-            print(f"扫描 {len(files)} 个文件，未发现问题。")
+        if not report_findings:
+            scope = f"（已过滤 {len(known)} 条基线内问题）" if baseline_obj else ""
+            print(f"扫描 {len(files)} 个文件，无新增问题。{scope}")
         else:
-            for f in findings:
+            for f in report_findings:
                 print(f"[{f.severity.value:7}] {f.location:40} {f.message}")
                 print(f"          {f.rule_id}  {', '.join(f.cwe)}")
-            print(f"\n扫描 {len(files)} 个文件，共 {len(findings)} 条发现。")
+            print(f"\n扫描 {len(files)} 个文件，新增 {len(report_findings)} 条"
+                  + (f"（另有 {len(known)} 条在基线内）" if baseline_obj else ""))
+
+    if args.sarif:
+        out = sarif.write(report_findings, args.sarif, tool_version=__version__)
+        print(f"SARIF 已写入 {out}")
+
+    if args.write_baseline:
+        baseline.save(baseline.build(findings), args.write_baseline)
+        print(f"基线已写入 {args.write_baseline}（{len(findings)} 条）")
+
+    if args.fail_on_new and baseline_obj is not None and report_findings:
+        _progress(f"存在 {len(report_findings)} 条基线之外的新问题，按 --fail-on-new 返回非零")
+        return 1
+
     return 0
 
 
@@ -216,6 +317,14 @@ def _emit(args: argparse.Namespace, results: list[RepairResult], target: Path, f
         out = write_report(content, Path(args.output))
         print(f"\n报告已写入 {out}")
 
+    if getattr(args, "sarif", None):
+        out = sarif.write([r.finding for r in results], args.sarif, tool_version=__version__)
+        print(f"SARIF 已写入 {out}")
+
+    if getattr(args, "write_baseline", None):
+        baseline.save(baseline.build([r.finding for r in results]), args.write_baseline)
+        print(f"基线已写入 {args.write_baseline}")
+
     return 0
 
 
@@ -240,7 +349,7 @@ def cmd_audit_or_fix(args: argparse.Namespace, do_fix: bool) -> int:
             touched = session.files_touched()
             print(f"\n即将把 {session.count()} 处修改写入 {len(touched)} 个文件：")
             for rel in touched:
-                print(f"  - {rel}（{len(session.accepted[rel])} 处）")
+                print(f"  - {rel}（{session.count_for(rel)} 处）")
             print("  每个文件会先生成 .bee.bak 备份，同一文件的修改按验证顺序应用")
 
             proceed = True

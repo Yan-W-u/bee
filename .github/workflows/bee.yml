@@ -1,0 +1,60 @@
+name: bee
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  scan:
+    name: 漏洞扫描
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 首次运行生成基线
+        run: |
+          if [ ! -f .bee-baseline.json ]; then
+            echo "::notice::未找到基线文件，本次扫描全量写入 .bee-baseline.json。提交它之后，后续只报新增问题。"
+            python -m bee scan . --write-baseline .bee-baseline.json --sarif bee.sarif
+            echo "BOOTSTRAP=1" >> "$GITHUB_ENV"
+          fi
+
+      - name: 只报新增问题
+        if: env.BOOTSTRAP != '1'
+        env:
+          BEE_LLM_API_KEY: ${{ secrets.BEE_LLM_API_KEY }}
+        run: |
+          # 有 API Key 时开启可解释性分析与补丁验证；没有则只做规则检测
+          if [ -n "$BEE_LLM_API_KEY" ]; then
+            python -m bee audit . --baseline .bee-baseline.json --sarif bee.sarif
+          else
+            python -m bee scan . --baseline .bee-baseline.json --sarif bee.sarif --fail-on-new
+          fi
+
+      - name: 上传 SARIF 到 Code Scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: bee.sarif
+          category: bee
+
+      - name: 保留报告
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bee-sarif
+          path: bee.sarif
+          retention-days: 14

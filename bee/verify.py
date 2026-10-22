@@ -29,49 +29,107 @@ from .models import Finding, PatchAttempt
 
 
 @dataclass
+class FileEdit:
+    """针对单个文件的一次精确替换。"""
+
+    file: str
+    old_string: str
+    new_string: str
+
+
 class EditProposal:
     """模型给出的修改建议。
 
     用 old/new 精确替换而非裸 diff，落地成功率更高。
 
-    edits 支持一次改多处——这不是可选项：修 pickle 漏洞要写 io.BytesIO
-    就得补 `import io`，修命令注入要写 subprocess.run 就得补 `import subprocess`。
-    只允许改一处的工具会在这种场景下永远失败，因为 import 和函数体不在同一段文本里。
+    为什么要支持跨文件：真实修复经常要连带改调用方。比如把
+    `execute(sql)` 改成 `execute(sql, params)`，所有调用点都得跟着改；
+    改函数签名同理。只允许单文件的工具在这种场景下只能给出半套修复，
+    而且报告还会说「已验证修复」——这比不修更危险。
+
+    edits 支持同一文件改多处也是必需的：修 pickle 漏洞要写 io.BytesIO
+    就得补 `import io`，import 和函数体不在同一段文本里。
+
+    构造方式两种都支持，保持向后兼容：
+        EditProposal("a.py", "old", "new", "理由")          # 单文件单处
+        EditProposal(file="a.py", edits=[FileEdit(...), ...])  # 多文件多处
     """
 
-    file: str
-    old_string: str = ""
-    new_string: str = ""
-    rationale: str = ""
-    raw_diff: str = ""
-    edits: list[tuple[str, str]] = field(default_factory=list)
+    def __init__(
+        self,
+        file: str = "",
+        old_string: str = "",
+        new_string: str = "",
+        rationale: str = "",
+        raw_diff: str = "",
+        edits: list[FileEdit] | None = None,
+    ) -> None:
+        self.file = file
+        self.rationale = rationale
+        self.raw_diff = raw_diff
+        if edits is not None:
+            self.edits: list[FileEdit] = list(edits)
+        elif old_string or new_string:
+            self.edits = [FileEdit(file, old_string, new_string)]
+        else:
+            self.edits = []
 
-    def all_edits(self) -> list[tuple[str, str]]:
-        return self.edits or [(self.old_string, self.new_string)]
+    @classmethod
+    def single(cls, file: str, old: str, new: str, rationale: str = "") -> "EditProposal":
+        return cls(file=file, old_string=old, new_string=new, rationale=rationale)
 
-    def apply_to(self, source_text: str) -> str | None:
-        text = source_text
-        for old, new in self.all_edits():
-            nxt = replace_once(text, old, new)
+    @property
+    def old_string(self) -> str:
+        return self.edits[0].old_string if self.edits else ""
+
+    @property
+    def new_string(self) -> str:
+        return self.edits[0].new_string if self.edits else ""
+
+    def files(self) -> list[str]:
+        """涉及的文件，按首次出现顺序。"""
+        seen: list[str] = []
+        for edit in self.edits:
+            if edit.file not in seen:
+                seen.append(edit.file)
+        return seen
+
+    def apply_to(self, texts: dict[str, str]) -> dict[str, str] | None:
+        """在 {相对路径: 内容} 的副本上依次应用所有编辑。任一失败则整体失败。"""
+        out = dict(texts)
+        for edit in self.edits:
+            if edit.file not in out:
+                return None
+            nxt = replace_once(out[edit.file], edit.old_string, edit.new_string)
             if nxt is None:
                 return None
-            text = nxt
-        return text
+            out[edit.file] = nxt
+        return out
 
-    def as_diff(self, source_text: str) -> str:
+    def as_diff(self, texts: dict[str, str]) -> str:
         if self.raw_diff.strip():
             return self.raw_diff.strip() + "\n"
-        patched = self.apply_to(source_text)
+
+        patched = self.apply_to(texts)
         if patched is None:
             return ""
-        old_lines = source_text.splitlines(keepends=True)
-        new_lines = patched.splitlines(keepends=True)
-        return "".join(
-            difflib.unified_diff(
-                old_lines, new_lines,
-                fromfile=f"a/{self.file}", tofile=f"b/{self.file}", n=4,
+
+        chunks: list[str] = []
+        for rel in self.files():
+            before = texts.get(rel, "")
+            after = patched.get(rel, "")
+            if before == after:
+                continue
+            chunks.append(
+                "".join(
+                    difflib.unified_diff(
+                        before.splitlines(keepends=True),
+                        after.splitlines(keepends=True),
+                        fromfile=f"a/{rel}", tofile=f"b/{rel}", n=4,
+                    )
+                )
             )
-        )
+        return "".join(chunks)
 
 
 def replace_once(source: str, old: str, new: str) -> str | None:
@@ -84,39 +142,97 @@ def replace_once(source: str, old: str, new: str) -> str | None:
     return source.replace(old, new, 1)
 
 
-class PatchSession:
-    """同一文件的多个漏洞必须累积修复。
+_TEST_DIR_NAMES = {"tests", "test", "__tests__", "spec", "specs", "testdata"}
+_PROTECTED_FILENAMES = {
+    "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "setup.cfg",
+    "package.json", "pyproject.toml", "Makefile", "jest.config.js",
+    "jest.config.ts", "vitest.config.ts", "go.mod", "Cargo.toml",
+}
 
-    真实代码里一个文件常有多个漏洞。如果每条都独立对着磁盘原文验证，
-    第二条补丁的 old_string 会指向已被第一条改掉的内容——验证通过、
-    合并时全废。所以这里维护「原始文本 + 已接受的编辑序列」，
-    后续验证都基于累积后的状态。
+
+def is_protected(rel_path: str) -> bool:
+    """判断这条路径是否禁止被补丁修改。
+
+    这是整套验证的命门：`tests_pass` 之所以可信，前提是测试本身没被动过。
+    模型完全可以「改测试让它变绿」——实测中它真的这么干了，去改
+    test_fingerprint_is_stable 的断言。所以这一层必须是硬拦截，不能只靠 prompt。
+    """
+    p = rel_path.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    parts = [x for x in p.split("/") if x]
+    if not parts:
+        return False
+
+    name = parts[-1]
+    if any(part.lower() in _TEST_DIR_NAMES for part in parts[:-1]):
+        return True
+    if name in _PROTECTED_FILENAMES:
+        return True
+    if parts[0] in {".github", ".gitlab", ".circleci"}:
+        return True
+
+    lowered = name.lower()
+    if lowered.startswith("test_") or lowered.startswith("test-"):
+        return True
+    return lowered.endswith((
+        "_test.py", "_test.go", ".test.js", ".test.ts", ".test.tsx",
+        ".spec.js", ".spec.ts", ".spec.tsx", "_spec.rb",
+    ))
+
+
+class PatchSession:
+    """累积修复会话。
+
+    两件事必须记住：
+    1. 同一文件的多个漏洞按顺序累积，后续验证基于已应用后的文本，
+       否则第二条补丁会在被第一条改掉的位置上找锚点。
+    2. 一条补丁可能横跨多个文件，所以这里存的是提案序列而不是
+       「文件 → 编辑」的映射，应用时再按文件聚合。
     """
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.accepted: dict[str, list[EditProposal]] = {}
+        self.proposals: list[EditProposal] = []
+
+    def base_texts(self, rel_paths: list[str]) -> dict[str, str] | None:
+        """取出这些文件在「已接受编辑之后」的样子。"""
+        out: dict[str, str] = {}
+        for rel in rel_paths:
+            try:
+                text = read_source(self.root / rel)
+            except OSError:
+                return None
+            for proposal in self.proposals:
+                for edit in proposal.edits:
+                    if edit.file != rel:
+                        continue
+                    nxt = replace_once(text, edit.old_string, edit.new_string)
+                    if nxt is not None:
+                        text = nxt
+            out[rel] = text
+        return out
 
     def base_text(self, rel_path: str) -> str | None:
-        target = self.root / rel_path
-        try:
-            text = read_source(target)
-        except OSError:
-            return None
-        for proposal in self.accepted.get(rel_path, []):
-            nxt = proposal.apply_to(text)
-            if nxt is not None:
-                text = nxt
-        return text
+        texts = self.base_texts([rel_path])
+        return texts.get(rel_path) if texts is not None else None
 
-    def commit(self, rel_path: str, proposal: EditProposal) -> None:
-        self.accepted.setdefault(rel_path, []).append(proposal)
+    def commit(self, proposal: EditProposal) -> None:
+        self.proposals.append(proposal)
 
     def files_touched(self) -> list[str]:
-        return sorted(self.accepted)
+        seen: list[str] = []
+        for proposal in self.proposals:
+            for rel in proposal.files():
+                if rel not in seen:
+                    seen.append(rel)
+        return sorted(seen)
+
+    def count_for(self, rel_path: str) -> int:
+        return sum(1 for p in self.proposals for e in p.edits if e.file == rel_path)
 
     def count(self) -> int:
-        return sum(len(v) for v in self.accepted.values())
+        return sum(len(p.edits) for p in self.proposals)
 
 
 # ---------------------------------------------------------------- 语法/编译检查
@@ -303,50 +419,72 @@ def verify_patch(
     round_no: int,
     *,
     run_tests: bool = True,
-    base_text: str | None = None,
+    base_texts: dict[str, str] | None = None,
 ) -> PatchAttempt:
-    target_rel = proposal.file or finding.path
-    target = root / target_rel
+    involved = proposal.files() or [finding.path]
 
     attempt = PatchAttempt(
         round=round_no,
         diff="",
         explanation=proposal.rationale,
-        file=target_rel,
+        file=involved[0],
         old_string=proposal.old_string,
         new_string=proposal.new_string,
-        edits=proposal.all_edits(),
+        edits=[(e.file, e.old_string, e.new_string) for e in proposal.edits],
     )
 
-    try:
-        original = base_text if base_text is not None else read_source(target)
-    except OSError as exc:
-        attempt.errors.append(f"无法读取目标文件: {exc}")
-        return attempt
+    texts: dict[str, str] = {}
+    for rel in involved:
+        if base_texts and rel in base_texts:
+            texts[rel] = base_texts[rel]
+            continue
+        try:
+            texts[rel] = read_source(root / rel)
+        except OSError as exc:
+            attempt.errors.append(f"无法读取 {rel}: {exc}")
+            return attempt
 
-    attempt.diff = proposal.as_diff(original)
+    attempt.diff = proposal.as_diff(texts)
 
-    # --- 1. 内存中先判定补丁是否可落地
-    patched_text = proposal.apply_to(original)
-    if patched_text is None:
+    # --- 0. 受保护文件一律不许碰：改测试/CI 配置会让验证失去意义
+    blocked = [rel for rel in involved if is_protected(rel)]
+    if blocked:
         attempt.errors.append(
-            "补丁无法应用：old_string 在文件中不唯一或找不到"
+            "补丁试图修改受保护文件，已拒绝：" + "、".join(blocked)
+            + "（测试与构建配置被改动后，验证结论不再可信）"
         )
         return attempt
-    if patched_text.strip() == original.strip():
+
+    # --- 1. 补丁必须落在漏洞所在文件上，否则谈不上修好
+    if finding.path not in involved:
+        attempt.errors.append(
+            f"补丁没有修改漏洞所在文件 {finding.path}，无法消除该漏洞"
+        )
+        return attempt
+
+    # --- 2. 逐文件应用，任一失败即整体失败
+    patched = proposal.apply_to(texts)
+    if patched is None:
+        attempt.errors.append("补丁无法应用：某条 old_string 在对应文件中不唯一或找不到")
+        return attempt
+    if all(patched[rel].strip() == texts[rel].strip() for rel in involved):
         attempt.errors.append("补丁内容与原文件相同，没有任何实际改动")
         return attempt
     attempt.applied = True
 
-    # --- 2. 重扫判定漏洞是否消失（不依赖文件系统，快）
+    # --- 3. 重扫判定漏洞是否消失
     tmp_scan_dir = Path(tempfile.mkdtemp(prefix="bee-scan-"))
     try:
-        scan_target = tmp_scan_dir / Path(target_rel).name
-        write_source(scan_target, patched_text)
-        remaining = [
-            f for f in scan_file(scan_target, tmp_scan_dir)
-            if f.rule_id == finding.rule_id
-        ]
+        for rel in involved:
+            probe = tmp_scan_dir / Path(rel).name
+            probe.parent.mkdir(parents=True, exist_ok=True)
+            write_source(probe, patched[rel])
+        remaining: list[Finding] = []
+        for rel in involved:
+            probe = tmp_scan_dir / Path(rel).name
+            remaining.extend(
+                f for f in scan_file(probe, tmp_scan_dir) if f.rule_id == finding.rule_id
+            )
         attempt.finding_gone = len(remaining) == 0
         if not attempt.finding_gone:
             attempt.errors.append(
@@ -355,23 +493,30 @@ def verify_patch(
     finally:
         shutil.rmtree(tmp_scan_dir, ignore_errors=True)
 
-    # --- 3. 落到临时副本上做编译与测试
+    # --- 4. 落到临时副本上做编译与测试
     workdir: Path | None = None
     try:
         workdir = _copy_project(root)
-        work_target = workdir / target_rel
-        write_source(work_target, patched_text)
+        for rel in involved:
+            write_source(workdir / rel, patched[rel])
 
-        ok, msg, checked = check_syntax(work_target)
-        if ok and detect_language(work_target) == "python":
-            missing = check_missing_imports(patched_text)
-            if missing:
+        ok = True
+        checked_any = False
+        for rel in involved:
+            work_target = workdir / rel
+            ok_one, msg, checked = check_syntax(work_target)
+            checked_any = checked_any or checked
+            if ok_one and detect_language(work_target) == "python":
+                missing = check_missing_imports(patched[rel])
+                if missing:
+                    ok_one = False
+                    msg = f"补丁引用了未 import 的模块: {', '.join(missing)}"
+            if not ok_one:
                 ok = False
-                msg = f"补丁引用了未 import 的模块: {', '.join(missing)}"
+                attempt.errors.append(f"{rel} 语法检查失败: {msg}")
+
         attempt.compiles = ok
-        attempt.compile_checked = checked
-        if not ok:
-            attempt.errors.append(f"语法检查失败: {msg}")
+        attempt.compile_checked = checked_any
 
         if run_tests and ok:
             baseline = _test_baseline(root)
@@ -427,15 +572,27 @@ def collect_baseline(root: Path) -> list[Finding]:
 
 
 def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
-    """把会话里累积的编辑按顺序写入原文件。每个文件只备份一次。
+    """把会话里累积的编辑写入原文件。每个文件只备份一次。
 
-    必须按 session 里的顺序应用：同一文件的多条补丁之间存在前后依赖，
-    打乱顺序会导致 old_string 对不上。
+    两件事必须做对：
+    1. 按提交顺序应用。同一文件的多条补丁存在前后依赖，打乱顺序会失配。
+    2. 先算出完整结果再写盘。中途失败就整文件放弃，不留半成品——
+       留半成品的后果是文件既不是原样也不是修复态，比不改更难排查。
     """
+    # 按文件聚合，但保留原始提交顺序
+    per_file: dict[str, list[FileEdit]] = {}
+    order: list[str] = []
+    for proposal in session.proposals:
+        for edit in proposal.edits:
+            if edit.file not in per_file:
+                per_file[edit.file] = []
+                order.append(edit.file)
+            per_file[edit.file].append(edit)
+
     written = 0
     errors: list[str] = []
 
-    for rel, proposals in session.accepted.items():
+    for rel in order:
         target = root / rel
         try:
             text = read_source(target)
@@ -443,12 +600,9 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
             errors.append(f"{rel}: 读取失败 {exc}")
             continue
 
-        backup = target.with_suffix(target.suffix + ".bee.bak")
-        shutil.copy2(target, backup)
-
         failed = False
-        for proposal in proposals:
-            nxt = proposal.apply_to(text)
+        for edit in per_file[rel]:
+            nxt = replace_once(text, edit.old_string, edit.new_string)
             if nxt is None:
                 errors.append(f"{rel}: 有一条补丁无法应用，文件未写入，请手动处理")
                 failed = True
@@ -457,6 +611,8 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
         if failed:
             continue
 
+        backup = target.with_suffix(target.suffix + ".bee.bak")
+        shutil.copy2(target, backup)
         write_source(target, text)
         written += 1
 
@@ -465,17 +621,14 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
 
 def apply_to_disk(root: Path, proposal: EditProposal) -> bool:
     """单条落盘，保留给脚本化场景。先备份原文件。"""
-    target = root / proposal.file
-    try:
-        original = read_source(target)
-    except OSError:
-        return False
-    patched = replace_once(original, proposal.old_string, proposal.new_string)
+    patched = proposal.apply_to({rel: read_source(root / rel) for rel in proposal.files()})
     if patched is None:
         return False
-    backup = target.with_suffix(target.suffix + ".bee.bak")
-    shutil.copy2(target, backup)
-    write_source(target, patched)
+    for rel, text in patched.items():
+        target = root / rel
+        backup = target.with_suffix(target.suffix + ".bee.bak")
+        shutil.copy2(target, backup)
+        write_source(target, text)
     return True
 
 

@@ -50,14 +50,19 @@ class Finding:
     references: list[str] = field(default_factory=list)
     trace: list[TraceStep] = field(default_factory=list)
     snippet: str = ""
-    detector: str = "semgrep"
+    # 命中行的规范化内容。指纹基于它而不是行号——
+    # 代码上下移动时行号会变，但漏洞还是同一个，baseline 不能因此失效。
+    code_line: str = ""
+    detector: str = "bee-rules"
     fingerprint: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.fingerprint:
-            basis = f"{self.path}:{self.start_line}:{self.rule_id}"
-            self.fingerprint = hashlib.sha1(basis.encode()).hexdigest()[:16]
+            basis = self.path + "|" + self.rule_id + "|" + " ".join(
+                (self.code_line or self.snippet).split()
+            )
+            self.fingerprint = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
 
     @property
     def location(self) -> str:
@@ -113,10 +118,11 @@ class PatchAttempt:
     diff: str
     explanation: str = ""
     # 保留可直接落盘的编辑序列，避免只有 diff 无法反推
+    # 每条是 (文件, 原片段, 新片段)，文件可以是不同路径（跨文件修复）
     file: str = ""
     old_string: str = ""
     new_string: str = ""
-    edits: list[tuple[str, str]] = field(default_factory=list)
+    edits: list[tuple[str, str, str]] = field(default_factory=list)
     applied: bool = False
     finding_gone: bool = False
     compiles: bool = False

@@ -1,6 +1,6 @@
 [project]
 name = "bee"
-version = "0.1.0"
+version = "1.0.0"
 description = "漏洞检测 + 可解释性修复 + 机器验证补丁"
 readme = "README.md"
 requires-python = ">=3.10"

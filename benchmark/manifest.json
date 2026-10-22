@@ -1,0 +1,31 @@
+{
+  "说明": "positives 是应该被检出的漏洞，negatives 是必须保持沉默的安全写法。行号允许 ±1 偏差。样本刻意包含多语言、多跳拼接、配置文件和常见误报陷阱，不是只挑规则能过的写。",
+  "positives": [
+    {"file": "py/sqli.py", "line": 6, "rule": "bee.sql-injection", "why": "先拼成变量再交给 execute"},
+    {"file": "py/sqli_multihop.py", "line": 4, "rule": "bee.sql-injection", "why": "两跳赋值 + execute，测变量追踪"},
+    {"file": "py/cmdi.py", "line": 5, "rule": "bee.command-injection", "why": "os.system 拼接外部输入"},
+    {"file": "py/path_traversal.py", "line": 5, "rule": "bee.path-traversal", "why": "os.path.join 未做越界校验"},
+    {"file": "py/path_concat.py", "line": 2, "rule": "bee.path-traversal", "why": "绝对路径字面量直接拼变量"},
+    {"file": "py/deserialization.py", "line": 5, "rule": "bee.unsafe-deserialization", "why": "pickle.loads 直接吃外部数据"},
+    {"file": "py/ssti.py", "line": 6, "rule": "bee.ssti", "why": "render_template_string 拼接请求参数"},
+    {"file": "py/order_by.py", "line": 2, "rule": "bee.dynamic-order-by", "why": "ORDER BY 列名来自参数，参数化无法防御"},
+    {"file": "js/xss.js", "line": 3, "rule": "bee.xss", "why": "innerHTML 直接赋外部输入"},
+    {"file": "js/prototype.js", "line": 2, "rule": "bee.prototype-pollution", "why": "Object.assign 合并 req.body"},
+    {"file": "js/eval_usage.js", "line": 2, "rule": "bee.code-injection", "why": "裸 eval(变量)，无任何拼接也要报"},
+    {"file": "go/sqli.go", "line": 8, "rule": "bee.sql-injection", "why": "database/sql 的 Query 拼接"},
+    {"file": "go/weak_crypto.go", "line": 9, "rule": "bee.weak-crypto", "why": "md5.Sum 做摘要（Go 风格写法）"},
+    {"file": "php/sqli.php", "line": 3, "rule": "bee.sql-injection", "why": "PHP 用 . 拼接，变量带 $ 前缀"},
+    {"file": "yaml/creds.yml", "line": 5, "rule": "bee.hardcoded-credential", "why": "配置文件里写死密码（冒号分隔）"},
+    {"file": "py/xxe.py", "line": 5, "rule": "bee.xxe", "why": "lxml XMLParser 默认开外部实体"}
+  ],
+  "negatives": [
+    {"file": "py/sqli_safe.py", "why": "参数化查询，参数值拼接是安全的"},
+    {"file": "py/sqli_fstring_safe.py", "why": "同样是参数化，SQL 文本里只有占位符"},
+    {"file": "py/cmdi_safe.py", "why": "列表形式 + shell=False"},
+    {"file": "py/path_safe.py", "why": "realpath + 前缀校验 + basename"},
+    {"file": "py/creds_env.py", "why": "从环境变量读取，无硬编码值"},
+    {"file": "js/xss_safe.js", "why": "textContent 不做 HTML 解析"},
+    {"file": "py/order_by_safe.py", "why": "列名走白名单映射"},
+    {"file": "py/xxe_safe.py", "why": "resolve_entities=False + no_network=True"}
+  ]
+}

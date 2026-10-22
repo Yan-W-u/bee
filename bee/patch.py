@@ -16,7 +16,7 @@ from .context import CodeContext
 from .io_utils import read_source
 from .llm import LLMClient, LLMError
 from .models import Explanation, Finding, PatchAttempt
-from .verify import EditProposal, PatchSession, replace_once, verify_patch
+from .verify import EditProposal, FileEdit, PatchSession, replace_once, verify_patch
 
 PATCH_SYSTEM = """你是负责修漏洞的工程师。你的补丁会经过机器验证，验不过就打回重来。
 
@@ -31,7 +31,12 @@ PATCH_SYSTEM = """你是负责修漏洞的工程师。你的补丁会经过机�
 7. 不要在模块顶层引入「import 时就抛异常」的代码。环境变量读取必须容忍缺失
    （给默认值、返回 None、或延迟到函数内部再读）。把模块级常量改成
    os.environ["X"] 会让整个模块无法 import，测试和调用方全部崩掉——这是最常见的误修。
-8. 如果漏洞必须跨文件才能修好，只改当前文件，并在 rationale 里说明还需要改哪些文件、怎么改。
+8. 绝对不许修改测试文件（test_*、*_test.py、tests/ 目录）、CI 配置（.github/）、
+   构建配置（package.json、pyproject.toml、go.mod、Makefile）。
+   改测试让它变绿是作弊，这类补丁会被直接拒绝，且浪费一轮重试。
+   如果测试因为这个漏洞本身需要调整，在 side_effects 里说明，不要自己动手改。
+9. 如果漏洞必须跨文件才能修好，可以在 edit 里指定 "file" 来改调用方，
+   但不能借此修改上述受保护文件。
 
 返回严格 JSON，不加 markdown 围栏：
 {
@@ -47,7 +52,11 @@ PATCH_SYSTEM = """你是负责修漏洞的工程师。你的补丁会经过机�
 - 按数组顺序应用，通常只需要一条。
 - 当修复需要新增 import（例如改用 io.BytesIO、subprocess.run、secrets.token_hex）时，
   必须再加一条 edit 改导入区，否则新名字未定义，代码会 NameError。
-  这种两处修改的场景很常见，不要试图把 import 和函数体塞进同一个 old_string。"""
+  这种两处修改的场景很常见，不要试图把 import 和函数体塞进同一个 old_string。
+- 当修复必然牵动调用方（改了函数签名、改了参数个数、改了返回结构），
+  在对应 edit 里写 "file": "调用方相对路径" 即可跨文件修改。
+  宁可多改一个文件把调用方同步掉，也不要留下半套修复——那比不修更危险。
+  每个 edit 的 file 都相对于项目根目录，缺省沿用顶层 file。"""
 
 
 def _patch_prompt(
@@ -195,12 +204,30 @@ def _fix_pair(text: str, old: str, new: str) -> tuple[str, str]:
     return old, new
 
 
-def _build_proposal(
-    data: dict, finding: Finding, root: Path, base_text: str | None = None
-) -> EditProposal:
-    file_rel = str(data.get("file") or finding.path)
+def _declared_files(data: dict, finding: Finding) -> list[str]:
+    """先从模型输出里解析出涉及哪些文件，好提前取出累积文本。"""
+    default = str(data.get("file") or finding.path)
+    out = [default]
+    raw_edits = data.get("edits")
+    if isinstance(raw_edits, list):
+        for item in raw_edits:
+            if not isinstance(item, dict):
+                continue
+            rel = str(item.get("file") or default)
+            if rel not in out:
+                out.append(rel)
+    return out
 
-    pairs: list[tuple[str, str]] = []
+
+def _build_proposal(
+    data: dict,
+    finding: Finding,
+    root: Path,
+    base_texts: dict[str, str] | None = None,
+) -> EditProposal:
+    default_file = str(data.get("file") or finding.path)
+
+    file_edits: list[FileEdit] = []
     raw_edits = data.get("edits")
     if isinstance(raw_edits, list):
         for item in raw_edits:
@@ -209,38 +236,41 @@ def _build_proposal(
             old = str(item.get("old_string") or "")
             new_value = item.get("new_string")
             if old and new_value is not None:
-                pairs.append((old, str(new_value)))
+                file_edits.append(FileEdit(str(item.get("file") or default_file), old, str(new_value)))
     # 兼容只返回单条 old/new 的模型
-    if not pairs and data.get("old_string"):
-        pairs = [(str(data["old_string"]), str(data.get("new_string") or ""))]
+    if not file_edits and data.get("old_string"):
+        file_edits = [FileEdit(default_file, str(data["old_string"]), str(data.get("new_string") or ""))]
 
-    proposal = EditProposal(file=file_rel, edits=pairs)
+    proposal = EditProposal(file=default_file, edits=file_edits)
     proposal.rationale = str(data.get("rationale") or "")
     side = str(data.get("side_effects") or "").strip()
     if side and side not in {"无", "none", "None", "N/A"}:
         proposal.rationale += f"\n\n副作用说明：{side}"
 
-    if base_text is not None:
-        source = base_text
-    else:
+    # 取每个文件的当前内容（可能已含前面补丁的改动）
+    current: dict[str, str] = {}
+    for edit in file_edits:
+        if edit.file in current:
+            continue
+        if base_texts and edit.file in base_texts:
+            current[edit.file] = base_texts[edit.file]
+            continue
         try:
-            source = read_source(root / file_rel)
+            current[edit.file] = read_source(root / edit.file)
         except OSError:
-            return proposal
+            current[edit.file] = ""
 
     # 逐条修正，并让后续编辑基于已应用的状态判断唯一性
-    text = source
-    fixed_pairs: list[tuple[str, str]] = []
-    for old, new in pairs:
-        actual_old, actual_new = _fix_pair(text, old, new)
-        fixed_pairs.append((actual_old, actual_new))
+    fixed: list[FileEdit] = []
+    for edit in file_edits:
+        text = current.get(edit.file, "")
+        actual_old, actual_new = _fix_pair(text, edit.old_string, edit.new_string)
+        fixed.append(FileEdit(edit.file, actual_old, actual_new))
         nxt = replace_once(text, actual_old, actual_new)
         if nxt is not None:
-            text = nxt
+            current[edit.file] = nxt
 
-    proposal.edits = fixed_pairs
-    if len(fixed_pairs) == 1:
-        proposal.old_string, proposal.new_string = fixed_pairs[0]
+    proposal.edits = fixed
     return proposal
 
 
@@ -283,18 +313,20 @@ def repair_finding(
             prev = attempt
             continue
 
-        base = session.base_text(str(data.get("file") or finding.path)) if session else None
-        proposal = _build_proposal(data, finding, root, base_text=base)
+        base_texts = None
+        if session is not None:
+            base_texts = session.base_texts(_declared_files(data, finding))
+        proposal = _build_proposal(data, finding, root, base_texts=base_texts)
         attempt = verify_patch(
             finding, proposal, root, round_no,
-            run_tests=run_tests, base_text=base,
+            run_tests=run_tests, base_texts=base_texts,
         )
         attempt.explanation = proposal.rationale
         attempts.append(attempt)
 
         if attempt.succeeded:
             if session is not None:
-                session.commit(proposal.file, proposal)
+                session.commit(proposal)
             break
         prev = attempt
 
