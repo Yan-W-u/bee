@@ -1,7 +1,7 @@
 # 漏洞审计与可解释性修复报告
 
-- 目标：`C:\Users\21854\WorkBuddy\2026-10-22-14-44-11\vulnfix\_e2e`
-- 生成时间：2026-10-22 16:09
+- 目标：`samples/vulnerable_app`
+- 生成时间：2026-10-22 19:10
 - 工具：bee（规则引擎 + LLM 四段式解释 + 机器验证补丁）
 
 > 所有补丁均在临时副本上验证，未改动原仓库。落盘需人工确认。
@@ -33,47 +33,53 @@
 
 #### 根因
 
-L19 的模块级常量 API_TOKEN 被赋值为明文 live 密钥 "sk_live_8f3a91bc77de4c02"，L20 的 DB_PASSWORD 同样被赋值为明文 "orders_prod_2024"。这里不成立的假设是「源码仓库、构建镜像、运行日志属于可信边界」：凭据与代码同生命周期，任何能读到 orders.py 的人（仓库协作者、CI 日志、镜像层、异常堆栈回显）都直接拿到凭据本身，且代码里没有任何从环境变量或密钥服务读取的间接层，因此不存在按环境轮换的可能。
+L19 的 API_TOKEN 和 L20 的 DB_PASSWORD 以字符串字面量形式硬编码在 orders.py 源码中，变量名直接暴露了凭据用途。安全假设「源码仅对开发者可见」不成立：该文件会进入版本库、构建镜像、CI 日志和部署包，任何能读取 orders.py 的人（包括仓库协作者、镜像拉取者、日志查看者）都能直接获得这两个凭据。
 
 #### 攻击路径
 
-入口是源码分发面而非 HTTP 参数：攻击者取得 orders.py 的任一副本（仓库读权限、CI 构建日志、容器镜像层、L3 注释表明该文件被用于验证链路而可能被复制传播），直接读取 L19 的 API_TOKEN 与 L20 的 DB_PASSWORD 字面量。前置条件仅为「能读到该文件」，不需要登录、不需要特定配置。注意：本文件内 API_TOKEN 与 DB_PASSWORD 均无消费点——L24 的 get_connection 使用 sqlite3.connect(DB_PATH)，未使用 DB_PASSWORD；文件内也没有任何代码引用 API_TOKEN。因此从本文件无法给出「凭据→具体下游系统」的完整调用链，凭据实际被哪个外部服务校验属于证据不足，缺的是引用这两个常量的调用方代码或配置。
+攻击者获取 orders.py 的途径包括：克隆/浏览代码仓库、拉取容器镜像并解包、读取 CI/CD 构建日志或异常堆栈中打印的模块级变量。拿到 L19 的 API_TOKEN 后，可冒充订单服务调用合作方接口（L46-L53 的 sync_to_partner 使用该 token 的语义虽未在本文件显式引用，但变量名和注释表明其用于生产 API 认证）；拿到 L20 的 DB_PASSWORD 后，可直连订单数据库。前置条件仅为读取源码的权限，无需登录目标系统。
 
 #### 影响面
 
-泄露对象是两枚生产形态凭据：API_TOKEN 以 sk_live_ 前缀标识为 live 环境密钥，DB_PASSWORD 命名为 orders_prod_2024 指向生产订单库。持有者可以以服务身份调用该 token 对应的外部接口，并以该口令连接生产订单数据库，从而读写 orders 表（本文件 L31 显示该库至少含 id、user_id、amount、note 四列，即订单金额与用户标识）。具体能读到哪张表、能执行什么操作，取决于这两个凭据在外部系统中的实际授权范围，本文件内证据不足，无法进一步界定。
+泄露的 API_TOKEN 可让攻击者以订单服务身份调用合作方生产接口，伪造或篡改订单同步数据；泄露的 DB_PASSWORD 可让攻击者直连订单数据库，读取 orders 表的 id、user_id、amount、note 字段（L31 的 SELECT 语句列出了这些字段），进而批量导出用户订单和金额信息。凭据无法按环境轮换，一旦泄露只能改代码重新发布。
 
 #### 修复原理
 
-修复把凭据的取值时机从「源码编写时」移到「进程启动时」：L19、L20 改为从环境变量或密钥管理服务读取，并在启动时对缺失值直接抛错。语义边界的变化在于源码不再承载秘密，仓库、镜像、日志中出现的只是变量名，泄露面从「所有代码副本」收缩到「运行环境的注入通道」，轮换时只需改注入值并重启，不必改代码重新发布。副作用是部署必须新增环境变量或密钥服务依赖，缺失时进程启动失败而非静默使用默认值——这是有意的失败即停；读取发生在模块导入期，无运行时性能代价。另外必须轮换已写入 L19、L20 的这两枚凭据，因为历史提交与镜像层中它们已经存在，改代码不会使其失效。
+将 L19/L20 改为从环境变量读取（如 os.environ['API_TOKEN']），把凭据的存储边界从「源码」移到「运行时环境」，使源码、镜像和日志不再携带秘密；启动时对缺失变量抛异常，避免空值静默运行。副作用是部署流程需注入环境变量，本地开发需配置 .env 或启动脚本；无性能代价。已泄露的凭据必须轮换，否则修复无效。
 
 #### 证据
 
-- L19: API_TOKEN 被赋值为明文 live 密钥字面量 sk_live_8f3a91bc77de4c02，凭据直接固化在源码中
-- L20: DB_PASSWORD 被赋值为明文口令字面量 orders_prod_2024，与 L19 同属模块级常量
-- L17: 注释「硬编码的凭据」确认 L19-L20 的赋值意图就是存放凭据，而非示例占位符
-- L10: 文件已 import os，具备改用 os.environ 读取凭据的条件，当前写法是主动选择而非环境限制
-- L24: get_connection 使用 sqlite3.connect(DB_PATH)，未引用 DB_PASSWORD，该口令在本文件内无消费点
-- L31: find_order 查询 orders 表的 id、user_id、amount、note，界定该库承载的订单数据范围
+- L19: API_TOKEN 以字符串字面量硬编码，值为 prod_api_token_8f3a91bc77de
+- L20: DB_PASSWORD 以字符串字面量硬编码，值为 db_pass_7c4e19d2
+- L18: 注释明确标注「硬编码的凭据」，确认变量用途为认证凭据
+- L31: SELECT 语句列出 orders 表的 id、user_id、amount、note 字段，是 DB_PASSWORD 泄露后可读的数据范围
+- L46: sync_to_partner 函数向合作方接口发送数据，API_TOKEN 的命名表明其用于此类外部调用认证
+- L10: 文件已 import os，具备改用 os.environ 读取环境变量的条件，但 L19/L20 未使用
 
-*模型置信度：90%*
+*模型置信度：95%*
 
 #### 补丁（已通过机器验证，待人工 review）
 
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -14,11 +14,11 @@
+@@ -14,11 +14,17 @@
  import urllib.request
  
  DB_PATH = "orders.db"
  
--# 硬编码的凭据
--API_TOKEN = "sk_live_8f3a91bc77de4c02"
--DB_PASSWORD = "orders_prod_2024"
-+# 凭据从运行环境注入，源码不再承载秘密
-+API_TOKEN = os.environ.get("ORDERS_API_TOKEN")
-+DB_PASSWORD = os.environ.get("ORDERS_DB_PASSWORD")
+-# 硬编码的凭据（示例值，不是真实密钥）
+-API_TOKEN = "prod_api_token_8f3a91bc77de"
+-DB_PASSWORD = "db_pass_7c4e19d2"
++# 凭据从运行时环境读取，源码中不再保存秘密
++API_TOKEN = os.environ.get("API_TOKEN")
++DB_PASSWORD = os.environ.get("DB_PASSWORD")
++
++
++def require_credentials():
++    """在真正使用凭据前校验环境变量已注入。"""
++    if not API_TOKEN or not DB_PASSWORD:
++        raise RuntimeError("缺少必需的环境变量 API_TOKEN / DB_PASSWORD")
  
  
  def get_connection():
@@ -85,9 +91,9 @@ L19 的模块级常量 API_TOKEN 被赋值为明文 live 密钥 "sk_live_8f3a91b
 ```
 DB_PATH = "orders.db"
 
-# 硬编码的凭据
-API_TOKEN = "sk_live_8f3a91bc77de4c02"
-DB_PASSWORD = "orders_prod_2024"
+# 硬编码的凭据（示例值，不是真实密钥）
+API_TOKEN = "prod_api_token_8f3a91bc77de"
+DB_PASSWORD = "db_pass_7c4e19d2"
 
 
 ```
@@ -104,28 +110,27 @@ DB_PASSWORD = "orders_prod_2024"
 
 #### 根因
 
-find_order 的 keyword 参数在第 31 行被直接字符串拼接进 SQL 文本：sql = "SELECT id, user_id, amount FROM orders WHERE note LIKE '%" + keyword + "%'"。这里不成立的假设是「keyword 只是 LIKE 模式里的字面量」——实际上 keyword 中的单引号会闭合第 31 行的 '%' 字面量，使后续内容成为 SQL 语法的一部分。第 32 行 cursor.execute(sql) 把拼接结果整体当作语句执行，数据库没有任何机会把 keyword 当数据对待。
+find_order 函数第 31 行将参数 keyword 直接拼接到 SQL 文本中：sql = "SELECT id, user_id, amount FROM orders WHERE note LIKE '%" + keyword + "%'"。keyword 是函数入参，没有任何类型检查、转义或白名单过滤。第 32 行 cursor.execute(sql) 将拼接后的完整字符串作为 SQL 语句执行，数据库解析器无法区分 keyword 中的单引号是数据还是语句结构，导致 keyword 中的 SQL 片段被当作语句执行。安全假设「keyword 只包含普通搜索词」不成立。
 
 #### 攻击路径
 
-入口是 find_order(keyword) 的 keyword 参数（第 27 行）。攻击者传入 keyword = "x' UNION SELECT id, username, password FROM users--"，第 31 行拼出 "... WHERE note LIKE '%x' UNION SELECT id, username, password FROM users--%'"，第 32 行 execute 执行该语句，第 33 行 fetchall 把 UNION 结果集返回给调用方。前置条件：调用方把外部可控字符串传给 find_order；本文件内没有对 keyword 做任何转义或白名单校验（第 27-31 行之间无校验代码）。是否需要登录、keyword 具体来自哪个 HTTP 参数或 CLI 参数，证据不足——提供的调用方只有 test_orders.py:38 的测试调用，无法确认生产入口。
+攻击者控制传入 find_order 的 keyword 参数（例如通过 Web 接口的搜索框、CLI 参数或任何调用该函数的入口）。构造 keyword 为 `' UNION SELECT id, username, password FROM users -- `，第 31 行拼接后 SQL 变为 `SELECT id, user_id, amount FROM orders WHERE note LIKE '%' UNION SELECT id, username, password FROM users -- %'`，第 32 行 execute 执行该语句，第 33 行 fetchall 返回注入查询的结果。前置条件：攻击者能控制 keyword 的值；无需登录（函数本身无鉴权逻辑）；无需特殊配置（SQLite 默认支持 UNION）。
 
 #### 影响面
 
-攻击者可读取 orders 表之外的任意表：以 sqlite3 连接（import 第 5 行 sqlite3）执行 UNION SELECT 即可读出 users 等表的全部列，包括同文件 fingerprint 函数暗示存在的口令摘要类字段。若连接用户有写权限，还可通过堆叠语句或子查询实施写入/删除。能否执行系统命令取决于 sqlite3 是否加载扩展，证据不足。
+攻击者可读取 orders 表之外的任意表数据。例如通过 UNION SELECT 读取 users 表的 username、password 字段，直接获取账户凭据；也可通过 SQLite 的 sqlite_master 表枚举所有表结构。若数据库连接用户权限较高，还可通过 ATTACH DATABASE 或 load_extension 等手法进一步操作文件系统或执行代码。业务上，订单查询接口会变成任意数据读取入口，泄露全部订单、用户及凭据数据。
 
 #### 修复原理
 
-把第 31 行改为 sql = "SELECT id, user_id, amount FROM orders WHERE note LIKE ?" 并在第 32 行改为 cursor.execute(sql, ('%' + keyword + '%',))，语义边界的变化是：keyword 永远只作为绑定参数值进入 LIKE 模式，其中的单引号、--、UNION 都只是普通字符，不再参与语法解析。副作用是 LIKE 通配符 % 和 _ 仍会被 keyword 内的同名字符解释为通配符，若业务要求字面匹配需额外 ESCAPE 处理；性能上与拼接方案无差异，SQLite 可复用该语句的查询计划。
+将第 31-32 行改为参数化查询：sql = "SELECT id, user_id, amount FROM orders WHERE note LIKE ?"，然后 cursor.execute(sql, ('%' + keyword + '%',))。这改变了语义边界：SQL 文本在编译时固定，keyword 的值仅作为绑定参数传入，数据库不会将其解析为 SQL 语法，单引号、UNION、注释符等均被当作普通字符处理。副作用是 LIKE 通配符 % 和 _ 仍会生效，若业务要求字面匹配需额外转义；性能上参数化查询可复用执行计划，无额外代价。
 
 #### 证据
 
-- L27: find_order 接收 keyword 参数，函数体内无任何校验或转义
-- L31: keyword 通过 + 直接拼进 SQL 文本的 LIKE 字面量中
-- L32: 拼接后的 sql 被原样交给 cursor.execute 执行
-- L33: fetchall 把执行结果返回给调用方，注入的 UNION 结果可直接外带
-- L5: import sqlite3 表明后端为 SQLite，支持 UNION 与堆叠语句
-- L38: 调用方以普通字符串调用 find_order，说明 keyword 是自由文本输入
+- L31: sql 变量由 keyword 直接字符串拼接构造，keyword 未做任何过滤或转义
+- L32: cursor.execute(sql) 将拼接后的完整字符串作为 SQL 语句执行
+- L27: find_order 函数签名接收 keyword 参数，该参数直接流入 L31 的拼接
+- L33: rows = cursor.fetchall() 返回注入查询的结果集，攻击者可读取任意表数据
+- L30: 使用 sqlite3 连接，SQLite 支持 UNION SELECT 等注入手法
 
 *模型置信度：95%*
 
@@ -134,7 +139,7 @@ find_order 的 keyword 参数在第 31 行被直接字符串拼接进 SQL 文本
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -27,10 +27,10 @@
+@@ -33,10 +33,10 @@
  def find_order(keyword):
      """按关键词查订单。"""
      conn = get_connection()
@@ -171,48 +176,46 @@ find_order 的 keyword 参数在第 31 行被直接字符串拼接进 SQL 文本
 
 #### 根因
 
-第 41 行的 `open(os.path.join("/tmp", target), "w")` 中，`target` 参数直接来自函数调用方，未经过任何规范化或白名单校验。`os.path.join` 在拼接时如果 `target` 是绝对路径（如 `/etc/passwd`），会丢弃 `/tmp` 前缀；如果 `target` 包含 `../`（如 `../../etc/passwd`），拼接结果会跳出 `/tmp` 目录。安全假设「`target` 是安全的相对文件名」在这里不成立，因为函数签名 `export_report(order_id, target)` 没有对 `target` 做任何约束。
+第 41 行 `open(os.path.join("/tmp", target), "w")` 直接把 `export_report` 的第二个形参 `target` 拼进路径。`os.path.join` 在 `target` 以 `/` 开头时会丢弃 `/tmp` 前缀，在 `target` 含 `../` 时不做任何规范化，因此「`target` 是 /tmp 下的文件名」这个安全假设不成立。第 40 行用 `order_id` 拼出的 `filename` 只用于返回值，与第 41 行实际写入的路径无关，说明写入路径完全由 `target` 决定。
 
 #### 攻击路径
 
-攻击者通过调用 `export_report(order_id, target)` 的入口传入恶意 `target` 值。该函数目前仅被测试代码 `test_orders.py:55` 调用，传入 `"ignored.txt"`，但函数本身是公开的，任何能调用该函数的代码路径（如 Web 路由、CLI 命令、内部 API）都可以传入 `target`。攻击者传入 `target="../../etc/cron.d/evil"` 或 `target="/etc/passwd"`，`os.path.join("/tmp", target)` 会生成 `/tmp/../../etc/cron.d/evil` 或 `/etc/passwd`，随后 `open(..., "w")` 以写模式打开该路径，写入 `str(order_id)`。前置条件：攻击者需要能够控制 `target` 参数并触发 `export_report` 调用；当前代码库中未发现除测试外的调用方，但函数本身未做任何防护。
+外部调用方把攻击者可控的字符串作为第二个实参传给 `export_report(order_id, target)`，例如 `target="../../etc/cron.d/x"` 或 `target="/root/.ssh/authorized_keys"`。函数在第 41 行执行 `os.path.join("/tmp", target)` 得到 `/tmp/../../etc/cron.d/x` 或 `/root/.ssh/authorized_keys`，随即以 `"w"` 模式打开并写入 `str(order_id)`。前置条件：调用方必须把外部输入直接作为 `target` 传入；本文件内没有对 `target` 做任何校验。是否需登录、是否需特定配置，证据不足——提供的调用方只有 `test_orders.py:55` 传入常量 `"ignored.txt"`，没有展示真实 HTTP/CLI 入口如何把外部参数接到 `target` 上。
 
 #### 影响面
 
-攻击者可以以运行该 Python 进程的用户权限，向文件系统任意可写路径写入内容（内容为 `str(order_id)`，攻击者可通过控制 `order_id` 部分控制写入内容）。例如覆盖 `/etc/cron.d/` 下的定时任务文件、写入 `~/.ssh/authorized_keys`、覆盖应用配置文件或日志文件，导致远程代码执行或权限提升。读取方面，由于以写模式打开，不会直接读取文件内容，但写入敏感路径可造成破坏。
+写入内容受限于 `str(order_id)`，攻击者能控制写入的字节（把 `order_id` 传成任意字符串即可写入任意内容），但只能覆盖/创建文件，不能读取文件内容。可覆盖运行进程有写权限的任意文件：覆盖 `/etc/cron.d/*` 或用户 crontab 可触发命令执行；覆盖 `~/.ssh/authorized_keys` 可植入公钥获得登录权限；覆盖应用自身的 `.py` 文件或配置可在下次加载时执行代码。若进程以 root 运行，影响面覆盖整机文件系统。
 
 #### 修复原理
 
-修复需要改变 `target` 的语义边界：只接受文件名（basename），拒绝包含路径分隔符或 `..` 的值，或者将 `target` 规范化后校验其仍位于 `/tmp` 目录内。例如使用 `os.path.basename(target)` 并检查 `target == basename`，或使用 `os.path.realpath(os.path.join("/tmp", target))` 后检查结果以 `/tmp/` 开头。这样 `../` 和绝对路径都会被拦截，因为规范化后的路径不再位于允许的根目录内。副作用是调用方不能再传入带子目录的路径，但当前函数语义本就是「指定文件名」，限制为 basename 符合设计意图；性能开销可忽略。
+修复要改变「`target` 可以是任意路径」这一语义边界：先 `os.path.realpath(os.path.join("/tmp", target))` 规范化，再用 `os.path.commonpath` 或 `startswith("/tmp" + os.sep)` 校验结果仍在 `/tmp` 内，不满足则拒绝；或只取 `os.path.basename(target)` 并加扩展名白名单。规范化后 `../` 和绝对路径都会被折叠成真实路径，越界检查在打开文件之前完成，因此 `open` 拿到的路径必然落在允许根目录内。副作用：合法的子目录写入会被拒绝，需要按业务确认是否允许子目录；`realpath` 会解析符号链接，若 `/tmp` 下存在指向外部的 symlink，校验会正确拒绝而不是跟随，这是预期行为。性能代价是一次 `realpath` 系统调用，可忽略。
 
 #### 证据
 
-- L41: `open(os.path.join("/tmp", target), "w")` 直接将 `target` 拼接到 `/tmp` 后打开文件，未做任何校验。
-- L38: 函数签名 `export_report(order_id, target)` 表明 `target` 是外部可控参数。
-- L41: `os.path.join` 在 `target` 为绝对路径时会丢弃 `/tmp` 前缀，在包含 `../` 时会跳出 `/tmp`。
-- L42: 写入内容为 `str(order_id)`，攻击者可通过控制 `order_id` 部分控制写入内容。
-- test_orders.py:55: 测试调用传入 `"ignored.txt"`，未覆盖恶意路径，但证明函数可被调用。
-- L40: `filename` 变量使用 `order_id` 拼接但未用于文件操作，与漏洞无关。
+- L41: `open(os.path.join("/tmp", target), "w")` 把形参 `target` 直接拼进路径并以写模式打开，是危险操作本身
+- L38: `target` 是 `export_report` 的公开形参，函数体内没有任何对它的校验或规范化
+- L40: 用 `order_id` 拼出的 `filename` 只被返回，与 L41 实际写入路径无关，写入路径完全由 `target` 决定
+- L41: `os.path.join` 遇到以 `/` 开头的 `target` 会丢弃 `/tmp` 前缀，遇到 `../` 不做折叠，拼接结果可越出 `/tmp`
+- L42: 写入内容为 `str(order_id)`，攻击者可通过 `order_id` 控制写入文件的字节内容
+- test_orders.py:55: 现有调用方只传入常量 `"ignored.txt"`，未展示外部入口如何把用户输入接到 `target`，入口可达性证据不足
 
-*模型置信度：90%*
+*模型置信度：75%*
 
 #### 补丁（已通过机器验证，待人工 review）
 
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -37,9 +37,15 @@
+@@ -43,9 +43,13 @@
  
  def export_report(order_id, target):
      """导出订单报告到指定文件名。"""
      filename = os.path.join("/var/reports", f"order_{order_id}.csv")
 -    with open(os.path.join("/tmp", target), "w") as fh:
-+    base = os.path.basename(target)
-+    if not base or base != target or base in (".", ".."):
-+        raise ValueError("target must be a plain file name")
-+    dest = os.path.realpath(os.path.join("/tmp", base))
-+    if os.path.dirname(dest) != os.path.realpath("/tmp"):
-+        raise ValueError("target escapes the report directory")
++    base_dir = os.path.realpath("/tmp")
++    dest = os.path.realpath(os.path.join(base_dir, target))
++    if os.path.commonpath([base_dir, dest]) != base_dir:
++        raise ValueError("target path escapes /tmp")
 +    with open(dest, "w") as fh:
          fh.write(str(order_id))
      return filename
@@ -242,28 +245,28 @@ def export_report(order_id, target):
 
 #### 根因
 
-第 50 行调用 ssl._create_unverified_context() 创建 SSLContext，该上下文将 verify_mode 设为 CERT_NONE 且 check_hostname 为 False，导致第 52 行 urllib.request.urlopen(req, timeout=10, context=ctx) 发起的 HTTPS 请求完全不校验证书链与主机名。安全假设「HTTPS 提供身份认证」在此不成立：代码只保证了传输加密，未验证对端身份。
+第 50 行调用 ssl._create_unverified_context() 创建 SSLContext，该上下文将 verify_mode 设为 CERT_NONE 且 check_hostname 为 False，随后第 52 行将该 ctx 传给 urllib.request.urlopen。这里不成立的假设是：urlopen 默认会校验证书链与主机名。显式传入未校验的 context 后，TLS 握手只完成加密协商，不验证对端证书是否由受信 CA 签发、是否匹配 partner.example.com，也不检查证书有效期。
 
 #### 攻击路径
 
-攻击者需位于 sync_to_partner 所在主机到 partner.example.com 的网络路径上（如同网段 ARP 欺骗、恶意 Wi-Fi、上游路由劫持或 DNS 投毒）。攻击者将 partner.example.com 解析指向自己控制的服务器并出示任意自签名证书；第 52 行 urlopen 使用第 50 行的 unverified context，接受该证书并完成 TLS 握手；随后第 51 行构造的订单 payload（body）被明文发送给攻击者，攻击者还可返回伪造响应，第 53 行 resp.status 被当作合作方成功状态返回。前置条件：无需登录本系统，无需修改配置，只需网络中间人位置。
+攻击者需位于 sync_to_partner 所在主机到 partner.example.com 的网络路径上（同网段 ARP 欺骗、恶意 Wi-Fi、上游 DNS 劫持或 BGP 劫持），并持有任意自签证书。攻击者将 partner.example.com 解析到自己控制的 IP，用自签证书完成 TLS 握手；第 50 行的 ctx 使客户端跳过证书链与主机名校验，第 52 行 urlopen 正常建立连接，第 51 行构造的订单 payload（body）被完整发送给攻击者，第 53 行返回攻击者伪造的 HTTP 状态码。前置条件仅为网络中间人位置，不需要登录凭证，也不需要修改任何配置。
 
 #### 影响面
 
-攻击者可完整读取并篡改发往合作方的订单同步数据（payload 内容由调用方传入，包含订单业务字段），并伪造同步成功状态（resp.status）使上层误以为订单已送达合作方，造成订单数据泄露与业务状态不一致。攻击者无法借此直接读取本地 sqlite 数据库或执行系统命令，影响限于该 HTTPS 通道上的数据机密性与完整性。
+攻击者以中间人身份读取并篡改 sync_to_partner 发出的全部订单同步数据：payload 经 json.dumps 序列化后包含订单字段，攻击者可直接获取订单内容；同时可返回任意状态码（如 200）使调用方误认为同步成功，从而掩盖订单被截获或篡改的事实。该函数不涉及数据库连接与命令执行，影响范围限于该 HTTPS 通道上传输的订单数据及其响应状态。
 
 #### 修复原理
 
-将第 50 行改为 ssl.create_default_context()（或显式加载合作方 CA 的 ssl.create_default_context(cafile=...)），恢复 verify_mode=CERT_REQUIRED 与 check_hostname=True，使第 52 行握手阶段校验证书链和主机名，中间人出示的自签名证书会在握手时被拒绝，请求不会发出。若合作方使用自签证书，应把其 CA 证书加入信任库而非关闭校验。副作用：合作方证书过期、主机名不匹配或使用内部 CA 未导入时，同步会抛出 ssl.SSLCertVerificationError，需要调用方处理异常；每次请求的证书链校验带来少量 CPU 开销，相对于 10 秒超时的网络 IO 可忽略。
+删除第 50 行的 ssl._create_unverified_context()，第 52 行改为不传 context（使用 urllib 默认的受信 CA 校验与主机名校验），或显式构造 ssl.create_default_context() 并仅对合作方自签证书通过 load_verify_locations 加载指定 CA。语义边界的变化是：TLS 对端身份从「不验证」变为「必须由受信 CA 签发且证书 SAN 匹配 partner.example.com」，中间人无法再用任意证书冒充服务端。副作用是若合作方确实使用自签证书，需把其 CA 证书部署到信任库，否则握手会抛 ssl.SSLCertVerificationError；性能上仅增加一次证书链校验，可忽略。
 
 #### 证据
 
-- L50: ssl._create_unverified_context() 创建了禁用证书与主机名校验的 SSLContext
-- L52: urlopen 显式传入该 context，使 HTTPS 请求使用不校验的 TLS 配置
-- L48: 目标 URL 为 https://partner.example.com 拼接 endpoint，确认走 TLS 通道
-- L51: 订单 payload 经 json.dumps 后作为请求体发送，是中间人可读取的业务数据
-- L53: 返回 resp.status，伪造响应可影响上层对同步结果的判断
-- L46: 函数 sync_to_partner 为漏洞所在函数，参数 endpoint 与 payload 由调用方控制
+- L50: ssl._create_unverified_context() 创建了 verify_mode=CERT_NONE、check_hostname=False 的 SSLContext
+- L52: 该 ctx 被传入 urllib.request.urlopen，使本次 HTTPS 请求跳过证书链与主机名校验
+- L48: 目标 URL 固定为 https://partner.example.com，说明本应校验该主机名但实际未校验
+- L51: 订单 payload 经 json.dumps 编码后作为请求体发送，中间人可直接读取
+- L53: 返回值仅为 resp.status，攻击者可伪造状态码使调用方误判同步成功
+- L46: sync_to_partner 是公开函数，任何调用方都会继承未校验 TLS 的行为
 
 *模型置信度：95%*
 
@@ -272,7 +275,7 @@ def export_report(order_id, target):
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -52,9 +52,9 @@
+@@ -56,9 +56,9 @@
  def sync_to_partner(endpoint, payload):
      """同步订单到合作方接口。"""
      url = "https://partner.example.com" + endpoint
@@ -308,26 +311,25 @@ def export_report(order_id, target):
 
 #### 根因
 
-load_cached_state(blob) 在第 58 行把参数 blob 原样交给 pickle.loads，中间没有任何类型检查、来源校验或受限 Unpickler。这里不成立的安全假设是「blob 只来自可信的本地缓存」：函数签名和 docstring（L57）都没有对 blob 的来源做任何约束，任何能控制 blob 字节的调用方都能让 pickle 在反序列化阶段执行 __reduce__ 指定的可调用对象。
+load_cached_state(blob) 在第 58 行直接把参数 blob 交给 pickle.loads，函数体内没有任何类型检查、来源校验或签名验证。这里不成立的安全假设是「blob 来自可信的缓存后端」：pickle 的 opcode 流在 loads 阶段就会解析 GLOBAL/STACK_GLOBAL 并导入、调用任意模块属性，因此只要 blob 可控，反序列化动作本身就等价于执行 blob 指定的可调用对象。
 
 #### 攻击路径
 
-证据不足：提供的代码里没有 load_cached_state 的调用点（调用方一节写明「未在此代码库中找到直接调用」），因此无法确定攻击者从哪个入口参数进入、经过哪些函数到达 L58。已确认的只有终点：任意可控的 blob 字节进入 L58 的 pickle.loads 即触发。要补全路径，需要提供调用 load_cached_state 的路由/任务代码，以及 blob 的写入侧（缓存后端、是否可被外部写入）。前置条件同样无法判定：是否需要登录、缓存是否跨信任边界，均缺证据。
+证据不足。提供的代码只覆盖 L56-L59，调用方明确标注为「未在此代码库中找到直接调用，可能通过框架路由或反射调用」。要写出完整路径，需要补充：哪个路由/任务/CLI 入口把外部数据传给 load_cached_state，blob 是来自 HTTP 参数、Cookie、缓存键值还是消息队列，以及进入前是否经过签名或来源限制。缺少这些文件，无法判断是否需要登录、是否需要特定配置。
 
 #### 影响面
 
-一旦 blob 可控，pickle.loads 在加载阶段就会调用攻击者指定的可调用对象，等价于以 orders.py 所在进程的权限执行任意代码。该进程已 import sqlite3（同文件定义 get_connection、find_order、export_report），因此攻击者可复用进程内的数据库连接读写订单库中的表，并可读取进程环境中的凭据、向 sync_to_partner 的对端发起出站请求。具体能触达哪张表取决于 get_connection 的连接配置，该函数体未提供，证据不足。
+证据不足。同文件定义了 get_connection、find_order、export_report、sync_to_partner 等函数，说明进程持有 sqlite3 连接并会向合作方发起网络请求，但未提供这些函数体，无法确认可读取的具体表名、可外联的具体地址。可确定的是：一旦 blob 可控，攻击者在应用进程权限内执行任意 Python 代码，进而操作该进程持有的 sqlite3 连接与 urllib.request 出网能力。
 
 #### 修复原理
 
-把 L58 的 pickle.loads 换成 json.loads 之类的纯数据解析，改变的是语义边界：反序列化从「可构造任意对象、可触发 __reduce__」收缩为「只能产出 dict/list/str/int 等内建数据」，加载过程不再有可执行入口，因此即使 blob 完全可控也无法升级为代码执行。若状态对象必须保留自定义类型，则改用 pickle.Unpickler 子类重写 find_class，只放行白名单内的类，把「任意全局符号可解析」收缩为「枚举集合内可解析」。副作用：JSON 无法表达 bytes、set、自定义类实例，需要改造状态的序列化格式并处理旧缓存数据的兼容/失效；白名单方案在新增状态类型时要同步维护白名单，漏加会导致反序列化报错而非静默降级。性能上 JSON 解析通常快于 pickle，无额外代价。
+把第 58 行的 pickle.loads 换成纯数据格式（json.loads）或受限的 Unpickler（find_class 白名单只放行明确需要的类），改变的是「反序列化阶段允许触达的对象空间」这一语义边界：前者把可表达的内容限制为 JSON 基本类型，后者把可导入的模块属性收敛到白名单，GLOBAL opcode 指向 os.system 之类的引用会在加载时被拒绝，而不是被执行。副作用是缓存中已有的 pickle 数据不再兼容，需要一次性迁移或双读过渡；JSON 不支持 bytes/自定义类，需为这些字段补编码层。性能上 json 解析通常快于 pickle，无额外代价。
 
 #### 证据
 
-- L58: pickle.loads 直接接收参数 blob，未做任何来源或类型校验
-- L57: docstring 只声明「加载缓存的状态对象」，未对 blob 的信任级别作任何约束
-- L56: 函数签名 load_cached_state(blob) 表明 blob 由调用方完全控制，函数内部无校验分支
-- L4: 文件 import 了 pickle，确认使用的是标准库 pickle 而非受限替代品
+- L58: pickle.loads(blob) 直接反序列化入参，函数内无任何校验分支
+- L56: 函数签名 load_cached_state(blob) 表明 blob 是外部传入参数而非函数内生成
+- L57: docstring 只说明用途为加载缓存状态，未声明来源可信约束
 
 *模型置信度：55%*
 
@@ -336,7 +338,7 @@ load_cached_state(blob) 在第 58 行把参数 blob 原样交给 pickle.loads，
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -60,9 +60,11 @@
+@@ -64,9 +64,11 @@
  
  
  def load_cached_state(blob):
@@ -375,25 +377,25 @@ def fingerprint(content):
 
 #### 根因
 
-第 62 行的 `fingerprint` 函数使用 `hashlib.md5` 对 `content` 计算哈希，并将结果作为去重指纹。该函数的设计假设是「MD5 输出足以唯一标识内容」，但 MD5 已被证明存在实用碰撞攻击：攻击者可以构造两个不同的 `content` 输入，使 `hashlib.md5(content.encode("utf-8")).hexdigest()` 返回相同的 32 位十六进制字符串。因此，`fingerprint` 的返回值不能作为内容唯一性的可靠依据。
+第 63 行的 `fingerprint` 函数直接调用 `hashlib.md5(content.encode("utf-8")).hexdigest()` 生成内容指纹。该函数的设计假设是「MD5 足以作为去重标识」，但 MD5 的碰撞攻击已实用化：攻击者可以构造两段不同内容产生相同 MD5 值，导致去重逻辑把不同订单内容误判为同一份。变量 `content` 是唯一输入，没有任何加盐或二次哈希，安全假设「相同指纹意味着相同内容」在 MD5 下不成立。
 
 #### 攻击路径
 
-攻击者需要能够控制传入 `fingerprint` 的 `content` 参数。当前提供的代码中，`fingerprint` 仅被测试文件 `test_orders.py` 第 51 行调用，未发现生产代码调用路径。若生产代码中存在调用 `fingerprint` 的入口（例如订单内容去重、缓存键生成），攻击者可以提交两个 MD5 碰撞的不同内容，使系统将其视为同一对象。前置条件：攻击者能向调用 `fingerprint` 的接口提交任意内容，且该接口依赖指纹做去重或完整性判断。证据不足：未提供生产调用方代码，无法确认外部输入是否可达 `fingerprint`。
+证据不足：提供的代码只包含 `fingerprint` 函数定义（L61-L64）和单元测试调用（test_orders.py:51），没有展示 `content` 参数从哪个外部入口（HTTP 请求、文件上传、数据库字段）传入，也没有展示 `fingerprint` 的返回值被用于哪张表的去重判断或缓存键。无法写出从攻击者可控参数到危险操作的完整路径。缺少调用链上游（如 `find_order`、`export_report`、`sync_to_partner` 中是否调用 `fingerprint`）和下游（指纹写入哪张表、是否作为唯一键）的代码。
 
 #### 影响面
 
-若 `fingerprint` 被用于订单去重，攻击者可构造碰撞内容绕过去重逻辑，导致重复订单被误判为同一订单，或不同订单被合并处理。若被用于缓存键，碰撞可导致缓存污染，使一个订单的缓存数据被另一个订单读取。当前代码中 `fingerprint` 仅出现在测试调用中，未发现对业务数据的实际影响。证据不足：缺少生产调用方及业务对象说明。
+证据不足：无法确认 `fingerprint` 的返回值被用于哪张表或哪个业务对象。若指纹用于订单去重，碰撞可导致不同订单被合并、覆盖或跳过处理；若用于缓存键，可导致缓存投毒。但当前代码上下文没有展示这些使用点，不能断言具体能读到哪张表或执行什么操作。
 
 #### 修复原理
 
-将 `hashlib.md5` 替换为 `hashlib.sha256`（或更强算法），改变了指纹的抗碰撞性语义边界：SHA-256 的输出空间和碰撞阻力使攻击者无法在可行计算资源内构造两个不同 `content` 产生相同指纹。修复后，`fingerprint` 的返回值重新满足「不同内容极大概率产生不同指纹」的假设。副作用是哈希计算耗时略增、输出长度从 32 位变为 64 位十六进制字符，若下游存储字段长度固定为 32 需同步调整。
+将 L63 的 `hashlib.md5` 替换为 `hashlib.sha256`（或 blake2b），改变的是「指纹抗碰撞性」这一语义边界：SHA-256 下构造相同指纹需要约 2^128 次操作，去重逻辑的「相同指纹即相同内容」假设重新成立。副作用是摘要长度从 32 字符变为 64 字符，若指纹列有长度约束（如 VARCHAR(32)）需同步迁移；性能上 SHA-256 比 MD5 慢约 2-3 倍，但对去重场景可忽略。若指纹用于安全敏感场景（如签名校验），应改用 HMAC-SHA256 并引入密钥。
 
 #### 证据
 
-- L62: 使用 hashlib.md5 计算内容指纹，MD5 存在实用碰撞攻击。
-- L61: fingerprint 函数接收外部 content 参数，未做任何输入约束。
-- L62: 返回值直接作为去重依据，碰撞可导致不同内容被判定为相同。
+- L63: `hashlib.md5(content.encode("utf-8")).hexdigest()` 是 MD5 的唯一使用点，输入 `content` 无加盐或二次哈希。
+- L61: 函数名为 `fingerprint`，docstring 写明「用于去重」，说明指纹的语义边界是内容等价性判断。
+- L62: docstring 只声明去重用途，未声明任何抗碰撞或安全校验需求。
 
 *模型置信度：30%*
 
@@ -402,7 +404,7 @@ def fingerprint(content):
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -67,9 +67,9 @@
+@@ -71,9 +71,9 @@
  
  
  def fingerprint(content):
@@ -439,28 +441,27 @@ def run_maintenance():
 
 #### 根因
 
-第 68 行 `os.system("sqlite3 " + DB_PATH + " 'VACUUM;'")` 将模块级变量 `DB_PATH` 直接拼接进 shell 命令字符串。`DB_PATH` 在 orders.py 中未在本函数内定义，其值来自模块级赋值或外部配置（证据不足：未提供 `DB_PATH` 的赋值位置）。安全假设是 `DB_PATH` 为可信常量，但该假设不成立：若 `DB_PATH` 可由环境变量、配置文件或调用方控制，则 shell 元字符（`;`、`|`、`$()`、反引号）会被解释执行。
+第 68 行 `os.system("sqlite3 " + DB_PATH + " 'VACUUM;'")` 把模块级变量 `DB_PATH` 直接拼接进 shell 命令字符串。这里的安全假设是「`DB_PATH` 是可信的常量」，但代码库中没有任何证据表明 `DB_PATH` 在赋值时被校验或固定为字面量；只要 `DB_PATH` 来自环境变量、配置文件或启动参数，shell 就会把其中的 `;`、`$()`、反引号当作命令语法执行。检测器命中的 `os.system("sqlite3 " + D` 正是这个拼接点。
 
 #### 攻击路径
 
-攻击者需能控制 `DB_PATH` 的值（例如通过环境变量、配置文件写入或调用 `run_maintenance` 前修改模块属性）。入口参数为 `DB_PATH`，路径为：外部可控值 → 模块级 `DB_PATH` → 第 68 行字符串拼接 → `os.system` 交给 `/bin/sh -c` 执行。前置条件：攻击者需具备修改 `DB_PATH` 的权限或影响其来源的配置；无需登录即可触发命令注入（若 `DB_PATH` 来自环境变量且进程以服务方式运行）。证据不足：未提供 `DB_PATH` 的赋值来源及 `run_maintenance` 的调用入口，无法确认外部可达性。
+入口是 `DB_PATH` 的赋值来源（本文件未提供该赋值行，证据不足，无法确认是环境变量、配置文件还是硬编码）。若 `DB_PATH` 可被外部影响，攻击者构造如 `DB_PATH="/tmp/x.db; id > /tmp/pwned"` 的值，`run_maintenance()` 在第 68 行执行 `os.system` 时，shell 先执行 `sqlite3 /tmp/x.db 'VACUUM;'`，再执行 `id > /tmp/pwned`。前置条件：攻击者能控制 `DB_PATH` 的取值（例如通过环境变量注入或配置文件写入），且 `run_maintenance` 被触发；调用方未在代码库中找到，触发方式证据不足。
 
 #### 影响面
 
-若 `DB_PATH` 可控，攻击者可在 `sqlite3` 命令后追加 shell 命令，以运行 Python 进程的操作系统用户权限执行任意命令。例如 `DB_PATH` 设为 `x; id > /tmp/pwned` 会执行 `id`。可读取或篡改 SQLite 数据库文件（通过 `sqlite3` 附加命令），并进一步读写进程可访问的文件系统、窃取凭据或横向移动。具体可读表取决于 `DB_PATH` 指向的数据库文件；证据不足：未提供数据库 schema 及进程运行权限。
+命令以运行本服务的 OS 用户权限执行。攻击者可读取该用户可访问的任意文件（包括同目录下的 SQLite 数据库文件、`pickle` 缓存文件）、写入任意路径、反弹 shell，进而横向移动到该用户可访问的其他服务。由于同文件存在 `pickle` 反序列化（`load_cached_state`）和 `urllib.request`（`sync_to_partner`），拿到命令执行后可篡改缓存文件或外联地址，扩大影响面。
 
 #### 修复原理
 
-改用参数列表形式调用 `subprocess.run(["sqlite3", DB_PATH, "VACUUM;"], shell=False)`，将 `DB_PATH` 作为独立 argv 元素传递，shell 不再解析其内容，语义边界从“shell 命令文本拼接”变为“程序参数传递”，`DB_PATH` 中的 `;`、`|`、`$()` 等字符只作为文件名的一部分。副作用：`DB_PATH` 若包含空格或特殊字符，sqlite3 会将其视为单个路径参数，行为与 shell 拼接不同；性能代价可忽略。若必须保留 shell，则需对 `DB_PATH` 做 `shlex.quote` 并白名单校验路径字符，但优先避免 shell。
+把 `os.system` 换成 `subprocess.run(["sqlite3", DB_PATH, "VACUUM;"], shell=False)`，语义边界从「把拼接后的字符串交给 shell 解析」变为「把 `DB_PATH` 作为单个 argv 元素传给 `sqlite3` 进程」。shell 不再参与，`;`、`$()`、反引号都只是 `DB_PATH` 字符串里的普通字符，不会产生第二条命令。副作用：`sqlite3` 的 `VACUUM;` 作为单个参数传入时，sqlite3 CLI 会把它当作一条 SQL 语句执行，行为与原来一致；性能代价可忽略（少一次 shell fork）。若 `DB_PATH` 本身不可信，还应校验其为预期路径下的文件，但仅此改动已堵住命令注入。
 
 #### 证据
 
-- L68: os.system 将 DB_PATH 直接拼接进 shell 命令字符串，未做转义或参数化
-- L68: 命令字符串包含单引号包裹的 'VACUUM;'，DB_PATH 位于 sqlite3 与单引号之间，可注入 shell 元字符
-- L66: run_maintenance 函数无参数，DB_PATH 来自模块级作用域，其可控性未在本文件内约束
-- L68: 使用 os.system 而非 subprocess 参数列表，shell 会解释 DB_PATH 中的 ; | $() 等字符
-- L67: 函数文档仅说明执行维护脚本，未对 DB_PATH 做任何校验或白名单
-- L68: 证据不足：未提供 DB_PATH 的赋值位置及 run_maintenance 的调用方，无法确认外部输入可达性
+- L68: os.system 把 DB_PATH 拼接进 shell 命令字符串，是命令注入的汇聚点
+- L68: 拼接后字符串包含单引号包裹的 'VACUUM;'，DB_PATH 中的分号可提前闭合并追加命令
+- L66: run_maintenance 无参数、无鉴权检查，任何能触发该函数的路径都会执行第 68 行
+- L67: 函数体只有 os.system 一行，没有对 DB_PATH 做任何校验或转义
+- L1-L7: import 列表包含 os，确认 os.system 可用；未提供 DB_PATH 赋值行，无法确认其来源
 
 *模型置信度：55%*
 
@@ -479,7 +480,7 @@ def run_maintenance():
  
  DB_PATH = "orders.db"
  
-@@ -72,9 +73,9 @@
+@@ -76,9 +77,9 @@
  
  
  def run_maintenance():
@@ -516,26 +517,27 @@ def run_maintenance():
 
 #### 根因
 
-L73 的 `app_debug = True` 是一个普通局部变量，赋值后没有任何代码读取它：L74 只调用 `print(find_order("test"))`，整个文件没有把 `app_debug` 传给任何框架初始化函数、没有 `app.run(debug=...)`、没有 `runserver`、没有 `debug=True` 的框架入口。检测规则 `bee.debug-enabled` 假设「debug 变量被框架消费并开启调试器」，这个假设在本文件中不成立。L8-L14 的 import 只有 hashlib/json/os/pickle/sqlite3/ssl/urllib.request，没有任何 Web 框架，因此不存在可被该变量开启的内置调试器或交互式 traceback 页面。这是误报：变量名匹配了规则，但语义上不构成 CWE-489。
+L73 的 `app_debug = True` 是一个局部变量，赋值后在整个文件中没有任何读取点：L74 只调用 `print(find_order("test"))`，`app_debug` 既没有传给任何框架（本文件未 import Flask/Django 等任何 Web 框架，见 L8-L14 的 import 列表），也没有被任何函数引用。检测器把「变量名含 debug 且值为 True」当作「生产环境开启调试模式」，但这里不存在任何调试开关的消费方，安全假设「该赋值会激活调试器/堆栈回显」不成立。此外 L1-L6 的模块注释明确声明这是故意包含漏洞的示例文件、不要在生产环境运行，L72 的 `if __name__ == "__main__"` 表明该分支只在直接执行脚本时进入，不构成服务端配置。
 
 #### 攻击路径
 
-证据不足。要构成调试模式暴露，需要存在一个消费 `app_debug` 的框架启动调用（如 Flask 的 `app.run(debug=app_debug)` 或 Django 的 DEBUG 配置），并存在可达的 HTTP 路由。本文件 L73-L74 之间没有这样的调用，调用方信息为「未找到直接调用」，无法构造从外部请求到调试器的路径。
+证据不足。要构成 CWE-489 的真实攻击路径，需要证明 `app_debug` 被某个 Web 框架的 debug 参数消费（例如 `app.run(debug=app_debug)`）或控制错误页渲染，但本文件 L8-L14 未 import 任何框架，L23-L69 的全部函数定义均未引用 `app_debug`，调用方信息也标注为「未在此代码库中找到直接调用」。缺少的关键证据是：消费 `app_debug` 的框架初始化代码，以及该脚本对外暴露 HTTP 端口的入口。
 
 #### 影响面
 
-证据不足。`app_debug` 未被任何代码读取，不改变运行时行为，不暴露堆栈、配置或交互式调试器。本文件中真实可被利用的问题在别处（L31 的 SQL 字符串拼接、L41 的路径拼接、L50 的 `ssl._create_unverified_context()`、L58 的 `pickle.loads`、L68 的 `os.system` 拼接），但它们与本次 `bee.debug-enabled` 信号无关，不应计入本报告。
+证据不足。当前代码中 `app_debug` 无任何运行时作用，不会暴露堆栈、配置或交互式调试器，因此不存在由该行直接导致的业务影响。需要说明的是，本文件确实存在其他可被利用的真实缺陷（L31 的 `keyword` 字符串拼接进 SQL、L41 的 `target` 直接拼进 `/tmp` 路径、L50 的 `ssl._create_unverified_context()` 关闭证书校验、L58 的 `pickle.loads`、L68 的 `os.system` 拼接），但这些与 L73 的 `app_debug` 无关，不应计入本条告警的影响。
 
 #### 修复原理
 
-针对本信号无需修复，因为不存在被开启的调试器。若团队希望消除规则噪音，可删除 L73 这个死变量，或改为从环境变量读取并默认 False（`app_debug = os.environ.get("APP_DEBUG", "0") == "1"`），但前提是将来真的把它传给框架启动函数；在当前代码中该改动不改变任何语义边界，也没有性能代价。真正需要修的是同文件的其他漏洞，应另开报告。
+本条为误报，不需要针对 L73 做修复。若团队希望消除静态扫描噪音，可删除 L73 这个未被使用的变量，或改为从环境变量读取（`app_debug = os.environ.get("APP_DEBUG", "0") == "1"`）——但后者只有在真正存在框架消费该变量时才有语义意义，当前代码中它只是改变一个死变量的值，不改变任何安全边界，也无性能代价。真正需要修的是同文件的其他缺陷，与本条无关。
 
 #### 证据
 
-- L73: `app_debug = True` 是唯一命中行，但它是局部变量赋值，不是框架调试开关。
-- L74: 紧随其后的唯一语句是 `print(find_order("test"))`，没有读取 `app_debug`。
-- L8-L14: import 列表不含任何 Web 框架，不存在可被该变量开启的内置调试器。
-- L72: 代码位于 `if __name__ == "__main__":` 块内，仅在直接执行脚本时运行，不构成对外服务入口。
+- L73: `app_debug = True` 是普通局部变量赋值，不是任何框架的 debug 配置项。
+- L74: 该分支内唯一语句是 `print(find_order("test"))`，未读取 `app_debug`。
+- L8: import 列表从 hashlib 开始，L14 结束于 urllib.request，全程未引入 Web 框架，无 debug 开关消费方。
+- L72: `if __name__ == "__main__"` 表明该分支仅在直接执行脚本时进入，不是服务端运行配置。
+- L1: 模块 docstring 声明该文件是故意包含漏洞的示例，不要在生产环境运行。
 
 *模型置信度：10%*
 
@@ -544,7 +546,7 @@ L73 的 `app_debug = True` 是一个普通局部变量，赋值后没有任何�
 ```diff
 --- a/orders.py
 +++ b/orders.py
-@@ -78,6 +78,6 @@
+@@ -82,6 +82,6 @@
      return True
  
  
@@ -578,38 +580,37 @@ if __name__ == "__main__":
 
 #### 根因
 
-L20 将数据库口令以字符串字面量 `DB_PASSWORD = "orders_prod_2024"` 直接写入 orders.py 源码，凭据与代码同生命周期。这里不成立的假设是「源码仓库/构建产物/运行镜像的可见范围等于凭据的授权范围」。L23-L24 的 get_connection() 实际使用 sqlite3.connect(DB_PATH)，并未引用 DB_PASSWORD，说明该口令在当前文件内没有消费点，其真实用途（连接哪个数据库、哪个账号）在提供的代码中证据不足；但硬编码事实由 L20 本身成立。
+L20 的模块级赋值 `DB_PASSWORD = "db_pass_7c4e19d2"` 把数据库口令以明文字面量固化在源码里，安全假设「凭据只存在于部署环境的密钥存储中」在这里不成立：口令的生命周期与 git 提交历史、构建产物、镜像层绑定，任何能读到 orders.py 的人（仓库协作者、CI 日志、镜像解包者）都直接拿到口令。同一模式在 L19 的 `API_TOKEN = "prod_api_token_8f3a91bc77de"` 重复出现。需要说明的是：本文件中 `get_connection()`（L23-L24）走的是 `sqlite3.connect(DB_PATH)`，并未使用 DB_PASSWORD，因此该常量在当前代码里没有消费点，它是「已泄露但尚未接线」的凭据，危害取决于仓库外是否有其他服务复用同一口令——这一点证据不足，缺少仓库外的部署配置与消费方代码。
 
 #### 攻击路径
 
-入口是源码分发链路而非运行时 HTTP 参数：任何能读取 orders.py 的人（仓库读权限、CI 日志中打印源码、镜像层解包、L41-L42 将内容写入 /tmp 的路径若被扩展为读取源码）即可在 L20 直接取得明文口令。当前代码中不存在从外部请求参数到 DB_PASSWORD 的调用链，get_connection()（L23-L24）也不使用该变量，因此「拿到口令后登录数据库」这一步缺少代码证据，需要补充该口令对应的数据库地址与账号配置才能闭合。前置条件：仅需对 orders.py 的读权限，无需登录应用。
+入口不是 HTTP 参数，而是源码读取面：攻击者获得 orders.py 的任一副本即可。路径一，拿到仓库读权限（内部人员、被投毒的依赖、泄露的 fork）→ 直接读取 L20 字面量。路径二，CI/CD 把构建日志或制品上传到可访问的存储 → 从镜像层或日志中提取 L20。路径三，若该文件被打进容器镜像，任何能拉取镜像的人执行 `docker save` 后解包即可读到 L20。前置条件仅为「能读到文件内容」，不需要登录业务系统、不需要任何运行时配置。当前代码内不存在从网络输入到 L20 的读取路径，因此不存在远程直接回显该口令的链路。
 
 #### 影响面
 
-泄露对象是 L20 的明文口令字符串本身，以及同文件 L19 的 API_TOKEN。由于 L23-L24 使用 SQLite 本地文件 orders.db 且不引用 DB_PASSWORD，无法从现有代码证明该口令能打开哪张表、哪个库；能确定的影响是：任何获得源码的人无条件持有该口令原文，且该口令无法在不改代码重新发布的情况下轮换。若该口令与外部 orders 生产库对应，则持有者可获得该账号在 orders 库上的全部权限（读写 orders 表），但这一对应关系在提供的代码中证据不足。
+泄露对象是数据库口令字符串本身。在本文件范围内，`get_connection()`（L23-L24）连接的是本地 SQLite 文件 orders.db，不使用该口令，所以仅凭本文件无法证明攻击者能凭此登录哪台数据库、读到 orders 表的哪些行。真实后果取决于该口令在仓库外被哪些服务复用：若被用于生产数据库账号，攻击者获得该账号的全部库权限（对 orders 表的读写、可能的 DROP/UPDATE）；若被用于其他系统，则横向到对应系统。这部分证据不足，缺少部署配置、数据库账号授权清单与消费方代码，无法给出确定的权限边界。
 
 #### 修复原理
 
-把 L20 改为从环境变量读取（如 os.environ["DB_PASSWORD"]）并在启动时对缺失值直接抛错，改变的是「凭据的可见边界」：源码、镜像层、代码评审记录中不再出现口令原文，凭据的授权范围与代码分发范围解耦，轮换只需改环境而不需要改代码重新构建。堵住的路径是源码/镜像读取者直接取得口令。副作用：部署配置必须注入该变量，否则启动即失败（这是有意的 fail-fast）；本地开发需要 .env 或 shell 导出，测试用例需注入假值。性能代价为零。注意：仅改读取方式不回收已泄露的 L20 口令，必须同时轮换 orders_prod_2024 与 L19 的 API_TOKEN。
+把 L20 改为从环境变量读取（本文件 L10 已 import os，无需新增依赖），例如在模块加载时执行 `DB_PASSWORD = os.environ["DB_PASSWORD"]`，缺失时抛 KeyError 使进程启动失败。语义边界的变化是：口令不再属于源码，而属于进程运行环境，源码副本、git 历史、镜像层不再携带秘密，轮换口令只需改环境变量并重启，不必改代码重新发版。用 `os.environ[...]` 而非 `.get()` 是为了让缺失配置在启动时立刻暴露，而不是把 None 带进后续连接逻辑。副作用：本地开发与测试需要额外注入环境变量，否则启动即失败；同时必须轮换 db_pass_7c4e19d2 本身，因为 L20 已存在于提交历史中，改代码不会让旧值失效。性能代价为零，环境变量读取发生在模块导入期一次。
 
 #### 证据
 
-- L20: DB_PASSWORD 以明文字符串字面量写死在源码中，构成硬编码凭据事实
-- L19: 同一区块内 API_TOKEN 同样以明文 sk_live_ 前缀字面量写死，泄露面不止一个凭据
-- L23: get_connection 定义为无参函数，未接收任何口令参数
-- L24: get_connection 实际调用 sqlite3.connect(DB_PATH)，未引用 DB_PASSWORD，该口令在文件内无消费点
-- L16: DB_PATH 为本地文件 orders.db，说明当前连接目标是 SQLite 文件而非需要口令的远程库
-- L5: 文件头声明不要在生产环境运行，降低该口令为真实生产口令的可能性，但不改变硬编码事实
+- L20: DB_PASSWORD 以明文字符串字面量赋值，凭据直接固化在源码中
+- L19: 同一文件重复出现硬编码凭据 API_TOKEN，说明是系统性写法而非孤例
+- L23: get_connection 使用 sqlite3.connect(DB_PATH) 而非 DB_PASSWORD，证明该常量在当前文件内无消费点
+- L10: 文件已 import os，具备改为 os.environ 读取的现成条件
+- L16: DB_PATH 为本地文件名，说明当前连接目标是本地 SQLite，不涉及远程数据库认证
 
-*模型置信度：90%*
+*模型置信度：85%*
 
 <details><summary>命中代码</summary>
 
 ```
 
-# 硬编码的凭据
-API_TOKEN = "sk_live_8f3a91bc77de4c02"
-DB_PASSWORD = "orders_prod_2024"
+# 硬编码的凭据（示例值，不是真实密钥）
+API_TOKEN = "prod_api_token_8f3a91bc77de"
+DB_PASSWORD = "db_pass_7c4e19d2"
 
 
 def get_connection():

@@ -15,9 +15,9 @@ import urllib.request
 
 DB_PATH = "orders.db"
 
-# 硬编码的凭据
-API_TOKEN = "sk_live_8f3a91bc77de4c02"
-DB_PASSWORD = "orders_prod_2024"
+# 硬编码的凭据（示例值，不是真实密钥）
+API_TOKEN = "prod_api_token_8f3a91bc77de"
+DB_PASSWORD = "db_pass_7c4e19d2"
 
 
 def get_connection():

@@ -134,12 +134,15 @@ def render_report(
     scanned_files: int,
     *,
     include_drafts: bool = True,
+    display_path: str | None = None,
 ) -> str:
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # 报告会被贴进评审单、工单、甚至公开仓库，不该带出别人的本机目录结构
+    shown = display_path or root.name
     head = [
         "# 漏洞审计与可解释性修复报告",
         "",
-        f"- 目标：`{root}`",
+        f"- 目标：`{shown}`",
         f"- 生成时间：{now}",
         f"- 工具：bee（规则引擎 + LLM 四段式解释 + 机器验证补丁）",
         "",

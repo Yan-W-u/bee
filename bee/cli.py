@@ -210,7 +210,9 @@ def _emit(args: argparse.Namespace, results: list[RepairResult], target: Path, f
         print(render_console(results))
 
     if args.output:
-        content = render_report(results, target, files)
+        content = render_report(
+            results, target, files, display_path=getattr(args, "target", None)
+        )
         out = write_report(content, Path(args.output))
         print(f"\n报告已写入 {out}")
 
