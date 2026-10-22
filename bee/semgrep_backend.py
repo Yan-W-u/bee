@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -88,7 +89,22 @@ def _cwe_list(meta: dict) -> list[str]:
         head = text.split(":", 1)[0].strip()
         if head.upper().startswith("CWE-"):
             out.append(head.upper())
-    return out
+    # 同一编号在 metadata 里常以不同描述出现多次；不去重会让 SARIF tags 违反
+    # uniqueItems，GitHub Code Scanning 会直接拒收整份文件。
+    return list(dict.fromkeys(out))
+
+
+def _owasp_list(meta: dict) -> list[str]:
+    raw = meta.get("owasp")
+    items = raw if isinstance(raw, list) else [raw] if raw else []
+    out = []
+    for item in items:
+        # semgrep 写成 "A03:2021 - Injection"；要保留 "A03:2021" 整段，
+        # 按 ":" 切会把年份切掉，只剩 "A03"，跟内置规则的 "A03:2021" 对不上。
+        m = re.match(r"\s*(A\d{2}(?::\d{4})?)", str(item))
+        if m:
+            out.append(m.group(1))
+    return list(dict.fromkeys(out))
 
 
 def _parse_trace(item: dict, root: Path) -> list[TraceStep]:
@@ -164,8 +180,7 @@ def _to_finding(item: dict, root: Path) -> Finding | None:
         start_line=start,
         end_line=max(end, start),
         cwe=_cwe_list(meta),
-        owasp=[str(x).split(":", 1)[0].strip() for x in (meta.get("owasp") or [])]
-        if isinstance(meta.get("owasp"), list) else [],
+        owasp=_owasp_list(meta),
         references=[str(x) for x in (meta.get("references") or [])][:5]
         if isinstance(meta.get("references"), list) else [],
         trace=_parse_trace(item, root),

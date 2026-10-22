@@ -89,6 +89,28 @@ class TestSarif(unittest.TestCase):
         self.assertEqual(len(doc["runs"][0]["tool"]["driver"]["rules"]), 1)
         self.assertEqual(len(doc["runs"][0]["results"]), 2)
 
+    def test_tags_have_no_duplicates(self):
+        """GitHub 的 SARIF 校验器对 tags 强制 uniqueItems，有重复就整份文件拒收。
+
+        真实翻车现场：CI 上 docker 里的 semgrep 生效，metadata 里同一个 CWE
+        以不同描述出现两次，上传 Code Scanning 直接失败。
+        """
+        finding = make_finding(
+            cwe=["CWE-89", "CWE-89", "CWE-943"],
+            owasp=["A03:2021", "A03:2021"],
+        )
+        doc = sarif.to_sarif([finding])
+        rule = doc["runs"][0]["tool"]["driver"]["rules"][0]
+        tags = rule["properties"]["tags"]
+        self.assertEqual(len(tags), len(set(tags)), f"tags 含重复项: {tags}")
+        # 去重不能误伤：编号本身要保留下来
+        self.assertIn("CWE-89", tags)
+        self.assertIn("CWE-943", tags)
+
+        props = doc["runs"][0]["results"][0]["properties"]
+        self.assertEqual(len(props["cwe"]), len(set(props["cwe"])))
+        self.assertEqual(len(props["owasp"]), len(set(props["owasp"])))
+
     def test_code_flows_from_trace(self):
         finding = make_finding(trace=[
             TraceStep("source", "app.py", 3, "k = request.args['k']"),

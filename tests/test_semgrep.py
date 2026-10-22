@@ -99,6 +99,33 @@ class TestConversion(unittest.TestCase):
         self.assertIn("CWE-89", finding.cwe)
         self.assertNotIn("Improper Neutralization of Special Elements used in an SQL Command", " ".join(finding.cwe))
 
+    def test_duplicate_cwe_and_owasp_collapsed(self):
+        """semgrep 的 metadata 里同一个 CWE/OWASP 会以不同描述出现多次。
+
+        不去重会让 SARIF tags 违反 uniqueItems，GitHub 上传直接拒收——
+        这个坑在 CI 上踩过一次，必须锁住。
+        """
+        meta = {
+            "cwe": [
+                "CWE-89: Improper Neutralization of Special Elements used in an SQL Command",
+                "CWE-89: SQL Injection",
+                "CWE-943: Improper Neutralization",
+            ],
+            "owasp": ["A03:2021 - Injection", "A03:2021"],
+        }
+        self.assertEqual(
+            semgrep_backend._cwe_list(meta),
+            ["CWE-89", "CWE-943"],
+        )
+        self.assertEqual(semgrep_backend._owasp_list(meta), ["A03:2021"])
+
+        item = dict(SAMPLE_JSON["results"][0])
+        item["extra"] = dict(item["extra"], metadata=meta)
+        finding = semgrep_backend._to_finding(item, self.tmp)
+        assert finding is not None
+        self.assertEqual(len(finding.cwe), len(set(finding.cwe)))
+        self.assertEqual(len(finding.owasp), len(set(finding.owasp)))
+
     def test_extracts_dataflow_trace(self):
         finding = semgrep_backend._to_finding(SAMPLE_JSON["results"][0], self.tmp)
         assert finding is not None

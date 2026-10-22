@@ -48,7 +48,11 @@ def _rule_entry(finding: Finding) -> dict:
     fix = str(finding.raw.get("fix_hint") or "").strip()
     help_parts = [p for p in (f"**根因**：{hint}" if hint else "", f"**修复**：{fix}" if fix else "") if p]
 
-    tags = ["security", "static-analysis"] + list(finding.cwe) + list(finding.owasp)
+    # tags 必须去重：SARIF schema 对它有 uniqueItems 约束，GitHub Code Scanning
+    # 一旦发现重复项会拒收整份文件（实测 rules[i].properties.tags 含重复就 400）。
+    tags = list(dict.fromkeys(
+        ["security", "static-analysis"] + [str(t) for t in finding.cwe] + [str(t) for t in finding.owasp]
+    ))
     return {
         "id": finding.rule_id,
         "name": finding.rule_id.split(".")[-1].replace("-", " "),
@@ -86,8 +90,8 @@ def _result_entry(finding: Finding, rule_index: int) -> dict:
         }],
         "partialFingerprints": {"beeFingerprint/v1": finding.fingerprint},
         "properties": {
-            "cwe": finding.cwe,
-            "owasp": finding.owasp,
+            "cwe": list(dict.fromkeys(str(c) for c in finding.cwe)),
+            "owasp": list(dict.fromkeys(str(o) for o in finding.owasp)),
             "detector": finding.detector,
             "severity": finding.severity.value,
         },

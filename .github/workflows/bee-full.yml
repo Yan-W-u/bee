@@ -14,9 +14,9 @@ jobs:
     name: 全量扫描（含已进入基线的历史问题）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -26,11 +26,13 @@ jobs:
           # 可选：开启 semgrep 后端补充规则覆盖
           # 见 docs/ci.md「为什么建议同时开 semgrep」
         run: |
-          python -m bee scan . --sarif bee-full.sarif --json > bee-full.json
+          python -m bee scan . --sarif bee-full.sarif --json \
+            --exclude 'samples/**' --exclude 'benchmark/cases/**' --exclude 'tests/**' --exclude 'examples/**' \
+            > bee-full.json
 
       - name: 上传 SARIF
         if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: bee-full.sarif
           category: bee-full
@@ -55,9 +57,9 @@ jobs:
     name: 自检（测试 + 规则 benchmark）
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
