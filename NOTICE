@@ -1,0 +1,83 @@
+bee
+Copyright (c) 2026 Yan-W-u
+
+本文件说明本项目与其前身 PentAGI 的关系，以及第三方代码的许可归属。
+
+================================================================
+一、版本沿革
+================================================================
+
+本仓库 (github.com/Yan-W-u/bee) 存在两个阶段，二者的代码来源不同，
+必须分开看待：
+
+【早期版本】2026-06 至 2026-09
+
+早期版本是 vxcontrol/pentagi 的修改版本，包含其 Go 后端、React 前端
+与 Wails 桌面壳的源码。该阶段代码以 MIT 协议分发，版权归 PentAGI 开发团队。
+该版本的后端未实现其声称的漏洞检测与修复能力，仅保留了前端占位页面，
+因此已被完全替换。
+
+【当前版本】v1.0 起
+
+当前版本是从零重写的独立实现，不包含 PentAGI 的任何源代码。
+包括但不限于：
+  - 检测规则引擎 (bee/detect.py)
+  - 上下文装配 (bee/context.py)
+  - 可解释性分析 (bee/explain.py)
+  - 补丁生成与多轮重试 (bee/patch.py)
+  - 机器验证链路 (bee/verify.py)
+
+这些模块均为本仓库原创，不存在来自 PentAGI 的代码片段。
+
+本项目的产品方向（自动化安全检测 + 可解释性修复）、以及"把检测与修复
+串成一条可验证流水线"的思路，受到 PentAGI 的启发，在此致谢。
+但当前代码与 PentAGI 无派生关系。
+
+================================================================
+二、PentAGI 的许可声明
+================================================================
+
+若你需要查阅或复用早期版本（fork 自 PentAGI）的代码，
+适用以下许可，完整文本见本文件末尾：
+
+    MIT License
+    Copyright (c) 2025 PentAGI Development Team
+    https://github.com/vxcontrol/pentagi
+
+按 MIT 协议要求，上述版权声明与许可声明应随早期版本代码一同保留。
+
+================================================================
+三、当前版本的依赖
+================================================================
+
+运行时依赖：无。仅使用 Python 3.10+ 标准库。
+开发/测试依赖：无。测试使用标准库 unittest，不依赖 pytest。
+
+当前版本不包含、不链接、不间接调用 PentAGI 及其相关组件
+（vxcontrol/cloud、vxcontrol/langchaingo、vxcontrol/graphiti-go-client）。
+
+================================================================
+四、PentAGI 许可全文
+================================================================
+
+MIT License
+
+Copyright (c) 2025 PentAGI Development Team
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

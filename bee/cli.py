@@ -1,0 +1,279 @@
+"""命令行入口：scan 只看，audit 解释，fix 出补丁并验证。"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+from .detect import BUILTIN_RULES, iter_source_files, load_custom_rules, scan_tree
+from .explain import explain
+from .llm import LLMClient, LLMConfig
+from .models import RepairResult, Severity
+from .patch import repair_finding
+from .report import render_console, render_report, write_report
+from .verify import PatchSession, apply_session, finding_still_present
+
+SEV_ORDER = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}
+
+
+def _progress(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def _select_rules(ids: list[str] | None, custom: Path | None) -> list:
+    rules = list(BUILTIN_RULES)
+    if custom:
+        rules = load_custom_rules(custom)
+    if ids:
+        wanted = {i.strip() for i in ids if i.strip()}
+        rules = [r for r in rules if r.id in wanted or r.id.split(".")[-1] in wanted]
+    return rules
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="bee",
+        description="漏洞检测 + 可解释性修复 + 机器验证",
+    )
+    sub = p.add_subparsers(dest="command")
+
+    def common(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("target", help="要审计的项目目录或单个文件")
+        sp.add_argument("--output", "-o", help="报告输出路径（.md）")
+        sp.add_argument("--json", action="store_true", help="以 JSON 输出结果")
+        sp.add_argument("--min-severity", choices=["info", "warning", "error"], default="info")
+        sp.add_argument("--rule", action="append", help="只跑指定规则（可多次）")
+        sp.add_argument("--rules-file", type=Path, help="自定义规则文件（Python，定义 RULES 列表）")
+        sp.add_argument("--include", action="append", help="只扫描匹配的 glob，如 'src/**/*.py'")
+        sp.add_argument("--exclude", action="append", default=[], help="排除匹配的 glob")
+        sp.add_argument("--limit", type=int, default=0, help="最多处理 N 条发现")
+        sp.add_argument("--llm-base-url", default=None)
+        sp.add_argument("--llm-key", default=None)
+        sp.add_argument("--llm-model", default=None)
+        sp.add_argument("--no-llm", action="store_true", help="不调用模型，只做规则检测")
+
+    sp_scan = sub.add_parser("scan", help="只检测，不调用模型")
+    common(sp_scan)
+
+    sp_audit = sub.add_parser("audit", help="检测 + 四段式可解释性分析")
+    common(sp_audit)
+
+    sp_fix = sub.add_parser("fix", help="检测 + 解释 + 生成补丁 + 机器验证")
+    common(sp_fix)
+    sp_fix.add_argument("--rounds", type=int, default=3, help="每个漏洞最多重试轮次")
+    sp_fix.add_argument("--no-tests", action="store_true", help="跳过回归测试，只做语法检查")
+    sp_fix.add_argument("--apply", action="store_true", help="把已验证补丁写入原仓库（会先备份）")
+    sp_fix.add_argument("--yes", action="store_true", help="配合 --apply 跳过交互确认")
+
+    return p
+
+
+def _collect_targets(target: Path, include: list[str] | None, exclude: list[str]) -> list[Path]:
+    if target.is_file():
+        return [target]
+    files = iter_source_files(target, include)
+    if exclude:
+        from fnmatch import fnmatch
+
+        rel = [str(p.relative_to(target)).replace("\\", "/") for p in files]
+        files = [p for p, r in zip(files, rel) if not any(fnmatch(r, g) for g in exclude)]
+    return files
+
+
+def cmd_scan(args: argparse.Namespace) -> int:
+    target = Path(args.target).resolve()
+    if not target.exists():
+        _progress(f"路径不存在: {target}")
+        return 2
+
+    rules = _select_rules(args.rule, args.rules_file)
+    files = _collect_targets(target, args.include, args.exclude)
+    findings = scan_tree(target if target.is_dir() else target.parent, rules)
+
+    if target.is_file():
+        name = target.name
+        findings = [f for f in findings if f.path.endswith(name)]
+
+    findings = [f for f in findings if SEV_ORDER[f.severity] >= SEV_ORDER[Severity(args.min_severity.upper())]]
+    if args.limit:
+        findings = findings[: args.limit]
+
+    if args.json:
+        print(json.dumps([f.__dict__ | {"severity": f.severity.value} for f in findings],
+                         ensure_ascii=False, indent=2, default=str))
+    else:
+        if not findings:
+            print(f"扫描 {len(files)} 个文件，未发现问题。")
+        else:
+            for f in findings:
+                print(f"[{f.severity.value:7}] {f.location:40} {f.message}")
+                print(f"          {f.rule_id}  {', '.join(f.cwe)}")
+            print(f"\n扫描 {len(files)} 个文件，共 {len(findings)} 条发现。")
+    return 0
+
+
+def _make_results(
+    args: argparse.Namespace,
+    target: Path,
+    do_fix: bool,
+) -> tuple[list[RepairResult], int]:
+    rules = _select_rules(args.rule, args.rules_file)
+    root = target if target.is_dir() else target.parent
+
+    files = _collect_targets(target, args.include, args.exclude)
+    findings = scan_tree(root, rules)
+    if target.is_file():
+        findings = [f for f in findings if f.path == target.name or f.path.endswith("/" + target.name)]
+
+    findings = [f for f in findings if SEV_ORDER[f.severity] >= SEV_ORDER[Severity(args.min_severity.upper())]]
+    if args.limit:
+        findings = findings[: args.limit]
+
+    if not findings:
+        return [], len(files)
+
+    client = None
+    if not args.no_llm:
+        cfg = LLMConfig.from_env()
+        if args.llm_base_url:
+            cfg.base_url = args.llm_base_url.rstrip("/")
+        if args.llm_key:
+            cfg.api_key = args.llm_key
+        if args.llm_model:
+            cfg.model = args.llm_model
+        client = LLMClient(cfg)
+        if not cfg.usable:
+            _progress("提示：未配置 API Key，解释会降级为规则先验，补丁不会生成。")
+            _progress("      设置 BEE_LLM_API_KEY 后重跑可启用完整能力。")
+
+    from .context import build_context
+
+    # 同一文件多处漏洞要累积修复，否则后一条补丁的上下文会被前一条改掉
+    session = PatchSession(root)
+
+    results: list[RepairResult] = []
+    total = len(findings)
+    for i, f in enumerate(findings, 1):
+        _progress(f"[{i}/{total}] {f.location}  {f.message}")
+        ctx = build_context(f, root)
+        expl = explain(f, ctx, client, root)
+        result = RepairResult(finding=f, explanation=expl)
+
+        if do_fix and client is not None and client.config.usable:
+            # 先看当前累积状态下这个漏洞是否还在——可能已被前一条补丁顺带修掉
+            base = session.base_text(f.path)
+            if base is not None and not finding_still_present(f, base, root):
+                result.covered_elsewhere = True
+                _progress("       ⊘ 已被前述补丁覆盖，跳过")
+                results.append(result)
+                continue
+
+            attempts = repair_finding(
+                f, expl, ctx, client, root,
+                max_rounds=getattr(args, "rounds", 3),
+                run_tests=not getattr(args, "no_tests", False),
+                session=session,
+            )
+            result.attempts = attempts
+            result.accepted = next((a for a in attempts if a.succeeded), None)
+            if result.accepted:
+                _progress("       ✅ 补丁通过验证")
+            elif attempts:
+                _progress(f"       ⚠️ {attempts[-1].failure_reason()}")
+        results.append(result)
+
+    setattr(args, "_session", session)
+    return results, len(files)
+
+
+def _emit(args: argparse.Namespace, results: list[RepairResult], target: Path, files: int) -> int:
+    if args.json:
+        payload = []
+        for r in results:
+            payload.append({
+                "finding": {
+                    "rule_id": r.finding.rule_id,
+                    "severity": r.finding.severity.value,
+                    "path": r.finding.path,
+                    "line": r.finding.start_line,
+                    "cwe": r.finding.cwe,
+                    "message": r.finding.message,
+                },
+                "explanation": r.explanation.__dict__ if r.explanation else None,
+                "status": r.status,
+                "attempts": [a.__dict__ for a in r.attempts],
+            })
+        print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
+    else:
+        print(render_console(results))
+
+    if args.output:
+        content = render_report(results, target, files)
+        out = write_report(content, Path(args.output))
+        print(f"\n报告已写入 {out}")
+
+    return 0
+
+
+def cmd_audit_or_fix(args: argparse.Namespace, do_fix: bool) -> int:
+    target = Path(args.target).resolve()
+    if not target.exists():
+        _progress(f"路径不存在: {target}")
+        return 2
+
+    results, files = _make_results(args, target, do_fix)
+    if not results:
+        print(f"扫描 {files} 个文件，未发现问题。")
+        return 0
+
+    session: PatchSession | None = getattr(args, "_session", None)
+    root = target if target.is_dir() else target.parent
+
+    if do_fix and getattr(args, "apply", False) and session is not None:
+        if session.count() == 0:
+            print("没有通过验证的补丁，无需落盘。")
+        else:
+            touched = session.files_touched()
+            print(f"\n即将把 {session.count()} 处修改写入 {len(touched)} 个文件：")
+            for rel in touched:
+                print(f"  - {rel}（{len(session.accepted[rel])} 处）")
+            print("  每个文件会先生成 .bee.bak 备份，同一文件的修改按验证顺序应用")
+
+            proceed = True
+            if not getattr(args, "yes", False):
+                answer = input("\n确认写入？[y/N] ").strip().lower()
+                proceed = answer in {"y", "yes"}
+            if not proceed:
+                print("已取消落盘。报告中的 diff 仍可手工应用。")
+            else:
+                written, errors = apply_session(root, session)
+                print(f"已写入 {written} 个文件。")
+                for err in errors:
+                    print(f"  ✗ {err}")
+
+    return _emit(args, results, target, files)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        parser.print_help()
+        return 1
+
+    if args.command == "scan":
+        return cmd_scan(args)
+    if args.command == "audit":
+        return cmd_audit_or_fix(args, do_fix=False)
+    if args.command == "fix":
+        return cmd_audit_or_fix(args, do_fix=True)
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
