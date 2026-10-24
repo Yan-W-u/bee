@@ -110,7 +110,7 @@ class TestGlobSemantics(unittest.TestCase):
             )
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = main(["scan", str(root), "--exclude", "tests/**", "--json"])
+                code = main(["scan", str(root), "--detector", "rules", "--exclude", "tests/**", "--json"])
             self.assertEqual(code, 0)
             data = json.loads(buf.getvalue())
             paths = [f["path"] for f in data]
@@ -412,7 +412,7 @@ class TestScanOutputAndExitCodes(unittest.TestCase):
         out = self.tmp / "report.md"
         buf = io.StringIO()
         with redirect_stdout(buf):
-            code = main(["scan", str(self.tmp), "-o", str(out)])
+            code = main(["scan", str(self.tmp), "--detector", "rules", "-o", str(out)])
         self.assertEqual(code, 0)
         self.assertTrue(out.exists())
         content = out.read_text(encoding="utf-8")
@@ -422,7 +422,7 @@ class TestScanOutputAndExitCodes(unittest.TestCase):
     def test_fail_on_findings_exit_code(self):
         buf = io.StringIO()
         with redirect_stdout(buf):
-            code = main(["scan", str(self.tmp), "--fail-on-findings"])
+            code = main(["scan", str(self.tmp), "--detector", "rules", "--fail-on-findings"])
         self.assertEqual(code, 1)
 
     def test_clean_project_exit_zero(self):
@@ -431,7 +431,7 @@ class TestScanOutputAndExitCodes(unittest.TestCase):
             (clean / "ok.py").write_text("x = 1\n", encoding="utf-8")
             buf = io.StringIO()
             with redirect_stdout(buf):
-                code = main(["scan", str(clean), "--fail-on-findings"])
+                code = main(["scan", str(clean), "--detector", "rules", "--fail-on-findings"])
             self.assertEqual(code, 0)
         finally:
             shutil.rmtree(clean, ignore_errors=True)
@@ -441,7 +441,7 @@ class TestScanOutputAndExitCodes(unittest.TestCase):
         other.write_text('API_TOKEN = "prod_api_token_9f3c1a77"\n', encoding="utf-8")
         buf = io.StringIO()
         with redirect_stdout(buf):
-            code = main(["scan", str(self.tmp / "app.py"), "--json"])
+            code = main(["scan", str(self.tmp / "app.py"), "--detector", "rules", "--json"])
         self.assertEqual(code, 0)
         data = json.loads(buf.getvalue())
         paths = {f["path"] for f in data}

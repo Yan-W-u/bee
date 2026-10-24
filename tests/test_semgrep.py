@@ -172,5 +172,41 @@ class TestAvailability(unittest.TestCase):
         self.assertIn("semgrep", hint.lower())
 
 
+class TestDockerCommand(unittest.TestCase):
+    """docker 分支的命令拼装。
+
+    这条路径只在装了 docker 的机器上才会走到——本地没有 docker，
+    所以曾经有一个变量名拼错（NameError）一直没被发现，直到 CI 上
+    docker 可用才炸。测试不依赖 docker：直接调 _build_command。
+    """
+
+    def test_command_has_readonly_mount_and_pinned_image(self):
+        cmd = semgrep_backend._build_command("docker", ["docker"], Path("/tmp/repo"), "auto", ".")
+        self.assertEqual(cmd[0], "docker")
+        joined = " ".join(cmd)
+        self.assertIn(":/src:ro", joined, "挂载必须只读，不能给容器写宿主仓库的权限")
+        self.assertIn(semgrep_backend.SEMGREP_IMAGE_DEFAULT, cmd)
+        self.assertNotIn(":latest", joined)
+        self.assertIn("--config", cmd)
+
+    def test_image_can_be_overridden(self):
+        import os
+
+        old = os.environ.get("BEE_SEMGREP_IMAGE")
+        try:
+            os.environ["BEE_SEMGREP_IMAGE"] = "my.registry/semgrep:9.9.9"
+            self.assertEqual(semgrep_backend._semgrep_image(), "my.registry/semgrep:9.9.9")
+        finally:
+            if old is None:
+                os.environ.pop("BEE_SEMGREP_IMAGE", None)
+            else:
+                os.environ["BEE_SEMGREP_IMAGE"] = old
+        self.assertEqual(semgrep_backend._semgrep_image(), semgrep_backend.SEMGREP_IMAGE_DEFAULT)
+
+    def test_local_mode_command(self):
+        cmd = semgrep_backend._build_command("local", ["semgrep"], Path("."), "auto", ".")
+        self.assertEqual(cmd[:2], ["semgrep", "--json"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

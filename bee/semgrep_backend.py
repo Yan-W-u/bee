@@ -33,7 +33,7 @@ SEMGREP_IMAGE_DEFAULT = "returntocorp/semgrep:1.182.0"
 def _semgrep_image() -> str:
     import os
 
-    return os.environ.get("BEE_SEMGREP_IMAGE") or SEMGERP_IMAGE_DEFAULT
+    return os.environ.get("BEE_SEMGREP_IMAGE") or SEMGREP_IMAGE_DEFAULT
 
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> tuple[int, str]:

@@ -138,6 +138,20 @@ def _filter_findings(
     return out
 
 
+def _semgrep_scan(root: Path, config: str) -> tuple[list[Finding], str]:
+    """调用 semgrep 后端，任何异常都降级为空结果。
+
+    semgrep 是可选增强，不是安装门槛：镜像拉不下来、命令拼错、容器被杀，
+    都只应该让这次扫描退回内置规则，而不是让整个 scan 崩掉。
+    """
+    from . import semgrep_backend
+
+    try:
+        return semgrep_backend.scan(root, config=config)
+    except Exception as exc:  # noqa: BLE001 - 兜底就是为了不让可选项拖垮主流程
+        return [], f"semgrep 后端异常，已忽略并退回内置规则：{type(exc).__name__}: {exc}"
+
+
 def _detect_all(
     root: Path,
     rules: list,
@@ -150,8 +164,6 @@ def _detect_all(
     include/exclude/单文件目标对所有后端生效：内置规则在遍历时剪枝，
     semgrep 结果在事后按同样语义过滤。
     """
-    from . import semgrep_backend
-
     mode = getattr(args, "detector", "auto")
     config = getattr(args, "semgrep_config", "auto") or "auto"
     include = getattr(args, "include", None)
@@ -159,10 +171,12 @@ def _detect_all(
     notes: list[str] = []
 
     if mode == "semgrep":
-        found, note = semgrep_backend.scan(root, config=config)
+        found, note = _semgrep_scan(root, config)
         notes.append(note)
         found = _filter_findings(found, include, exclude, only_paths)
         if not found:
+            from . import semgrep_backend
+
             notes.append(semgrep_backend.install_hint())
         return found, notes
 
@@ -174,7 +188,7 @@ def _detect_all(
     if mode == "rules":
         return rule_findings, ["内置规则引擎"]
 
-    found, note = semgrep_backend.scan(root, config=config)
+    found, note = _semgrep_scan(root, config)
     notes.append(note)
     if not found:
         if mode == "both":

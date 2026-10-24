@@ -11,3 +11,6 @@ orders.db
 .bee-baseline.json
 bee.sarif
 _e2e/
+_*.json
+_*.txt
+_jids*
