@@ -53,6 +53,9 @@ def _status_line(result: RepairResult) -> str:
             bits.append("测试通过")
         elif a.tests_pass is False:
             bits.append("测试失败")
+        elif any("基线" in n or "已失败" in n for n in a.notes):
+            # 红基线/环境不可用与「没有测试」是两件事，不能都写成「无测试可跑」
+            bits.append("回归信号不可用（项目测试本就无法通过）")
         else:
             bits.append("无测试可跑")
         return f"✅ **已验证修复**（第 {a.round} 轮）— " + " · ".join(bits)
@@ -81,6 +84,14 @@ def render_finding(index: int, result: RepairResult) -> str:
 
     if e is not None:
         conf = f"{e.confidence:.0%}" if e.confidence else "未评估"
+        if e.degraded:
+            lines += [
+                "> ⚠️ **解释已降级**：多轮校验后证据仍未通过行号/格式校验，"
+                "以下内容**不可作为已确认根因使用**，本次未据此生成补丁。",
+                "",
+                f"> 降级原因：{e.degrade_reason or '证据校验未通过'}",
+                "",
+            ]
         lines += [
             "#### 根因",
             "",
@@ -115,6 +126,8 @@ def render_finding(index: int, result: RepairResult) -> str:
             "```",
             "",
         ]
+        if result.accepted.notes:
+            lines += ["**验证备注**："] + [f"- {n}" for n in result.accepted.notes] + [""]
     elif result.attempts:
         lines += ["#### 未通过的补丁尝试", ""]
         for a in result.attempts:

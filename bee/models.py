@@ -62,7 +62,11 @@ class Finding:
             basis = self.path + "|" + self.rule_id + "|" + " ".join(
                 (self.code_line or self.snippet).split()
             )
-            self.fingerprint = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
+            # usedforsecurity=False：这里只做指纹去重，不是加密用途。
+            # 显式声明也让 weak-crypto 规则不误报这一行。
+            self.fingerprint = hashlib.sha1(
+                basis.encode("utf-8"), usedforsecurity=False
+            ).hexdigest()[:16]
 
     @property
     def location(self) -> str:
@@ -93,6 +97,11 @@ class Explanation:
     confidence: float = 0.0
     # 每条结论指向的具体证据（行号 / 数据流步骤），用于反幻觉
     evidence: list[str] = field(default_factory=list)
+    # True = 多轮校验后证据仍不合格，内容不可信。
+    # 降级的解释可以进报告（附带标注），但**不许再作为补丁 prompt 的输入**——
+    # 编造的根因会直接把补丁带偏。
+    degraded: bool = False
+    degrade_reason: str = ""
 
     def is_complete(self) -> bool:
         return all(

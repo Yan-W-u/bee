@@ -20,7 +20,7 @@
   ],
   "negatives": [
     {"file": "py/sqli_safe.py", "why": "参数化查询，参数值拼接是安全的"},
-    {"file": "py/sqli_fstring_safe.py", "why": "同样是参数化，SQL 文本里只有占位符"},
+    {"file": "py/sqli_fstring_safe.py", "why": "f-string 只拼白名单映射的固定表名，用户输入走占位符"},
     {"file": "py/cmdi_safe.py", "why": "列表形式 + shell=False"},
     {"file": "py/path_safe.py", "why": "realpath + 前缀校验 + basename"},
     {"file": "py/creds_env.py", "why": "从环境变量读取，无硬编码值"},

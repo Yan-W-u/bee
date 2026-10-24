@@ -17,6 +17,8 @@ from .models import Finding
 # 单条 finding 的上下文预算（字符），防止把长文件整段塞进 prompt
 MAX_FUNC_CHARS = 6000
 MAX_CALLER_CHARS = 2500
+# 调用方搜索的文件数上限：大仓库全量 rglob 会把每条 finding 的成本放大上千倍
+MAX_SCAN_FILES = 2000
 
 
 def _numbered(source: str, start_line: int, width: int = 5) -> str:
@@ -303,14 +305,23 @@ def _find_taint_sources(text: str) -> list[str]:
 
 
 def _find_callers(root: Path, func_name: str, exclude: Path, limit: int = 4) -> list[CallerSite]:
+    """全仓搜索调用方，但设上限：大仓库 rglob 可能扫到上万个文件，
+    每条 finding 都跑一遍全量搜索，时间和 token 成本都不可控。
+    """
     if not func_name or len(func_name) < 3:
         return []
     callers: list[CallerSite] = []
     try:
-        files = [p for p in root.rglob("*") if p.is_file() and p.suffix in
-                 {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".php"}
-                 and not any(part in {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
-                             for part in p.parts)]
+        files: list[Path] = []
+        for p in root.rglob("*"):
+            if len(files) >= MAX_SCAN_FILES:
+                break
+            if not p.is_file() or p.suffix not in {".py", ".js", ".ts", ".tsx", ".jsx", ".go", ".java", ".php"}:
+                continue
+            if any(part in {".git", "node_modules", "__pycache__", ".venv", "venv", "dist", "build"}
+                   for part in p.parts):
+                continue
+            files.append(p)
     except OSError:
         return []
 
@@ -327,7 +338,7 @@ def _find_callers(root: Path, func_name: str, exclude: Path, limit: int = 4) -> 
         for m in pat.finditer(text):
             line_no = text.count("\n", 0, m.start()) + 1
             lines = text.splitlines()
-            snippet = "\n".join(lines[max(0, line_no - 2): line_no + 1])
+            snippet = "\n".join(lines[max(0, line_no - 2): line_no + 1])[:MAX_CALLER_CHARS]
             # 跳过定义处
             if re.search(r"(?:def|function|func|class)\s+" + re.escape(func_name), snippet):
                 continue

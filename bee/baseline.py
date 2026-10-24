@@ -33,7 +33,12 @@ class Baseline:
 
 
 def load(path: Path) -> Baseline:
-    data = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"基线文件不是合法 JSON（{path}）：{exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"基线文件格式不对（顶层应是对象）：{path}")
     entries: dict[str, dict] = {}
     for item in data.get("findings") or []:
         fp = str(item.get("fingerprint") or "")

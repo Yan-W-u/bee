@@ -16,7 +16,7 @@ from .context import CodeContext
 from .io_utils import read_source
 from .llm import LLMClient, LLMError
 from .models import Explanation, Finding, PatchAttempt
-from .verify import EditProposal, FileEdit, PatchSession, replace_once, verify_patch
+from .verify import EditProposal, FileEdit, PatchSession, replace_once, safe_join, verify_patch
 
 PATCH_SYSTEM = """你是负责修漏洞的工程师。你的补丁会经过机器验证，验不过就打回重来。
 
@@ -256,8 +256,9 @@ def _build_proposal(
             current[edit.file] = base_texts[edit.file]
             continue
         try:
-            current[edit.file] = read_source(root / edit.file)
-        except OSError:
+            current[edit.file] = read_source(safe_join(root, edit.file))
+        except (OSError, ValueError):
+            # 越界路径（../、绝对路径）在这里就断掉，不留到写盘阶段
             current[edit.file] = ""
 
     # 逐条修正，并让后续编辑基于已应用的状态判断唯一性
@@ -284,6 +285,7 @@ def repair_finding(
     max_rounds: int = 3,
     run_tests: bool = True,
     session: PatchSession | None = None,
+    rules: list | None = None,
 ) -> list[PatchAttempt]:
     """多轮修复，直到验证通过或用尽轮次。
 
@@ -319,7 +321,7 @@ def repair_finding(
         proposal = _build_proposal(data, finding, root, base_texts=base_texts)
         attempt = verify_patch(
             finding, proposal, root, round_no,
-            run_tests=run_tests, base_texts=base_texts,
+            run_tests=run_tests, base_texts=base_texts, rules=rules,
         )
         attempt.explanation = proposal.rationale
         attempts.append(attempt)

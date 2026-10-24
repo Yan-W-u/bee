@@ -45,8 +45,10 @@ bee 的应对是三层硬约束：
 | `impact` 影响面 | 具体能读到什么、执行什么、拿到什么权限 | 排不出优先级 |
 | `fix_rationale` 修复原理 | 这个改动改变了什么语义边界 | 无法 review，无法说服别人 |
 
-解释层带有反幻觉机制：`evidence` 里每条必须写成 `L行号: 结论`，工具会校验行号是否
-真实存在、是否离漏洞位置过远。不合格就带着问题清单要求模型重写一次。
+解释层带有反幻觉机制：`evidence` 里每条必须写成 `L行号: 结论`，工具会**强制校验**：
+格式不对、行号超出文件范围、引用空行、引用函数外（import 区除外）都会打回重写。
+两轮仍不合格的解释会被标记「已降级」——可以进报告（附降级标注），但**不会**再作为
+补丁生成的输入，编造的根因不会把补丁带偏。
 
 ---
 
@@ -61,15 +63,16 @@ succeeded = applied and finding_gone and compiles and (tests_pass is not False)
 | `applied` | 每条 `old_string` 在文件中唯一存在，替换后内容确实发生变化 |
 | `finding_gone` | **重新扫描**修补后的文件，原规则不再命中 |
 | `compiles` | 语法检查（`py_compile` / `node --check` / `gofmt -e`）+ 缺 import 检查 |
-| `tests_pass` | 自动探测 pytest / unittest / npm test / go test，在临时副本上运行 |
+| `tests_pass` | 显式 `--run-tests` 开启后，在临时副本上跑 pytest / unittest / npm test / go test |
 
 `finding_gone` 是最重要的一项。它不信任模型的自我表述，只看扫描器还报不报。
 实测中「加了 trim 就说是修好了」这类补丁全靠这一项拦下来。
 
 ### 两个来自实战的补充
 
-**基线对照。** 跑测试前先在未打补丁的副本上跑一次。如果项目本身就跑不起来
-（缺依赖、缺环境变量），则 `tests_pass` 记为「不可用」而不是「失败」。
+**基线对照。** 跑测试前先在未打补丁的副本上跑一次。项目本身就是红的（缺依赖、
+缺环境变量、测试写坏）时，`tests_pass` 记为「不可用」而不是「失败」——
+红基线上的非零退出码是**既有事实**，不能记成「补丁破坏了功能」。
 没有这一步，一个没装 `requests` 的项目会让你看到满屏假的「补丁破坏了功能」。
 
 **缺 import 检查。** 模型修 pickle 漏洞时会写 `io.BytesIO(...)`，修命令注入时会写
@@ -118,7 +121,7 @@ succeeded = applied and finding_gone and compiles and (tests_pass is not False)
 | 解释 | 四段式（根因 / 攻击路径 / 影响 / 修复原理），证据必须落到真实行号 | `audit` / `fix` 默认开启 |
 | 补丁 | 一次提交多条编辑、可跨文件，缩进自动容错 | 补丁协议里的 `edits[]` |
 | 补丁 | 同文件多漏洞累积应用，冲突时整条回滚不留半成品 | `fix` 默认开启 |
-| 验证 | 四项信号 + 基线对照 + 缺 import 检查 + 禁止改测试文件 | `--rounds` / `--no-tests` |
+| 验证 | 四项信号 + 基线对照 + 缺 import 检查 + 禁止改测试文件 | `--rounds` / `--run-tests` |
 | 输出 | Markdown 报告 / JSON / SARIF 2.1.0（含 `security-severity` 与 codeFlows） | `-o` / `--json` / `--sarif` |
 | 增量 | 指纹不依赖行号，只报相对基线的新增问题 | `--baseline` / `--write-baseline` / `--fail-on-new` |
 | 集成 | GitHub Actions（PR 检查 + 上传 SARIF）、pre-commit、GitLab / Jenkins | `.github/workflows/`、`docs/ci.md` |
@@ -229,22 +232,49 @@ GitLab SAST 报告消费。
 
 ```
 --min-severity {info,warning,error}   只看某个级别以上
---detector {auto,rules,semgrep,both}  选检测后端
+--detector {auto,rules,semgrep,both}  选检测后端（scan / audit / fix 均生效）
 --semgrep-config auto                  semgrep 规则集，可传本地目录
 --rule bee.sql-injection              只跑指定规则，可重复
---include 'src/**/*.py'               只扫匹配的文件
---exclude 'tests/**'                  排除目录
+--include 'src/**/*.py'               只扫匹配的文件（支持 ** 跨目录）
+--exclude 'tests/**'                  排除匹配的文件（支持 ** 跨目录）
 --limit 10                            只处理前 N 条
 --rounds 3                            每个漏洞最多重试轮次（默认 3）
---no-tests                            跳过回归测试，只做语法检查
+--run-tests                           运行被审计仓库的测试做回归（默认关闭）
+--no-tests                            强制不跑测试（兼容旧用法，等价默认值）
 --no-llm                              强制离线
 --baseline PATH                       只报相对基线新增的问题
 --write-baseline PATH                 把当前结果写成基线
 --fail-on-new                         有新增问题时退出码 1
+--fail-on-findings                    还有发现就退出码 1（CI 门禁）
 --sarif PATH                          输出 SARIF 2.1.0
 --json                                结构化输出
 --apply --yes                         落盘（先备份）
 ```
+
+---
+
+## 安全边界：在跑不可信仓库之前
+
+`bee fix` 会在临时副本里执行**被审计仓库自己的测试代码**（在 `--run-tests` 开启时），
+这等于执行任意代码。已经做的防护：
+
+- 回归测试**默认关闭**，显式 `--run-tests` 才开，交互终端还会再确认一次；
+- 测试子进程的环境变量按名单剥离（`BEE_LLM_*` / `*_KEY` / `*_TOKEN` / 云凭据），
+  API Key 不会随测试代码泄露；
+- 补丁路径经 `safe_join` 校验，`../`、绝对路径、符号链接一律拒绝写入；
+- 落盘拦截测试文件、CI 配置、构建配置、`.env*`、密钥文件、`.git/`（大小写不敏感）。
+
+仍然要遵守的一条：**只对可信仓库运行 fix**，或者放进容器/虚拟机再跑。
+临时副本不是沙箱，它防的是改文件，防不了执行代码。`scan` 是纯静态的，
+可以放心跑任何仓库。
+
+另外两条：
+
+- `--rules-file` 会 **exec 该 Python 文件**（与 `python your_rules.py` 等价），
+  只加载自己写的规则文件。
+- semgrep 的 docker 模式把仓库以**只读**方式挂进容器，镜像固定版本
+  （`returntocorp/semgrep:1.182.0`，可用环境变量 `BEE_SEMGREP_IMAGE` 覆盖）。
+  docker 模式等于信任该镜像。
 
 ---
 
@@ -319,6 +349,10 @@ RULES = [
 python -m bee audit ./src --rules-file my_rules.py
 ```
 
+> ⚠️ `--rules-file` 会 **执行该 Python 文件的代码**（import 语义，等价
+> `python my_rules.py`）。只加载自己写的规则文件，不要加载第三方仓库里
+> 未审阅的规则文件。
+
 ---
 
 ## 检测层 benchmark
@@ -333,8 +367,9 @@ python benchmark/run.py --strict     # 出现 FN / FP 时退出码 1，可进 CI
 
 样本在 `benchmark/cases/`，正例 16 个（Py / JS / Go / PHP / YAML，含多跳拼接、
 `eval(变量)`、Go 的 `md5.Sum`、PHP 的 `.` 拼接、配置文件冒号凭据、lxml 默认 XXE），
-负例 8 个（参数化查询、列表形式 `subprocess`、`textContent`、白名单 order-by、
-`resolve_entities=False` 等常见误报陷阱）。行号允许 ±1 偏差。
+负例 8 个（参数化查询、f-string 只拼白名单表名、列表形式 `subprocess`、
+`textContent`、白名单 order-by、`resolve_entities=False` 等常见误报陷阱）。
+行号允许 ±1 偏差。
 
 ```
 正例 16 / 负例 8   →   TP 16  FN 0  FP 0
@@ -363,8 +398,9 @@ Precision 100.0%   Recall 100.0%   F1 100.0%
    但「另一个文件里还有一处同样的写法」这种搜索工具不做——它只在
    `side_effects` 里写明还需要改哪里。跨文件补丁的验证同样走四项信号，
    只是 `tests_pass` 的覆盖面取决于项目自己的测试。
-5. **`tests_pass` 依赖项目本身有测试。** 没有测试或测试跑不起来的项目，
-   只能验证到语法层，这件事工具会在报告里明确写出来，不会假装通过。
+5. **`tests_pass` 默认不跑**（`--run-tests` 显式开启），且依赖项目本身有测试。
+   没有测试或测试跑不起来的项目，只能验证到语法层，这件事工具会在报告里
+   明确写出来，不会假装通过。项目原有测试就是红的，记「不可用」不记「失败」。
 6. **规则文本会被自己命中。** 已经加了注释行和正则文本的过滤，但含大量安全
    模式定义的项目仍可能产生少量误报，用 `--exclude` 排除规则目录。
 7. **不替代专业 SAST。** 如果是合规要求（等保、PCI-DSS），该上 Semgrep / CodeQL /
@@ -374,6 +410,9 @@ Precision 100.0%   Recall 100.0%   F1 100.0%
 9. **benchmark 的数字偏乐观。** `benchmark/cases` 里的样本是照着规则能力写的，
    16/16 命中只证明「规则按设计工作」，不代表真实项目的检出率。它适合进 CI
    看回归趋势，不适合当准确率指标对外引用。
+10. **大仓库的成本有上限但没有硬预算。** 调用方搜索最多扫 2000 个文件、单条
+    finding 的上下文有字符预算，但每条补丁仍要复制一次完整项目、`--run-tests`
+    时还要跑一遍全量测试。几十万行的仓库建议先 `--limit` / `--min-severity`。
 
 ### 实测数据
 
@@ -406,7 +445,8 @@ Precision 100.0%   Recall 100.0%   F1 100.0%
 落地成功率明显更高，而且天然避免了"改错地方"。
 
 **为什么验证层要复制整个项目？** 跑测试需要完整上下文。
-代价是大项目会慢，所以有 `--no-tests` 可以只做语法检查。
+代价是大项目会慢。默认不开回归测试（`--run-tests` 才开），只做语法检查就够快；
+调用方搜索有文件数上限，单条 finding 的上下文也有字符预算，防止在大仓库上失控。
 
 ---
 
@@ -417,7 +457,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # 检测层准确率回归
 ```
 
-69 个用例覆盖八块：
+105 个用例覆盖九块：
 
 - `tests/test_verify.py` —— 四项信号是否真的在拦截（含"能应用能编译但没修好"、
   "语法被改坏"、沙箱隔离三个关键用例）
@@ -428,10 +468,14 @@ python benchmark/run.py --strict      # 检测层准确率回归
 - `tests/test_imports.py` —— 缺 import 检测（含局部变量遮蔽、非标准库不误报）
 - `tests/test_guard.py` —— 模型改测试文件 / 改受保护路径时是否被硬拦截
 - `tests/test_sarif_baseline.py` —— SARIF 结构与 `security-severity`、
-  指纹稳定性（插注释、移动行号不产生假「新增」）
-- `tests/test_semgrep.py` —— semgrep 输出转换、不可用时静默回退
+  指纹稳定性（插注释、移动行号不产生假「新增」）、tags 去重
+- `tests/test_semgrep.py` —— semgrep 输出转换、CWE/OWASP 去重、不可用时静默回退
 - `tests/test_detect.py` —— 单条规则的判定边界，重点是 `safe_when` 压制是否生效
-  （参数化 SQL、`shell=False`、`resolve_entities=False`、YAML 环境变量注入）
+  （参数化 SQL、`shell=False`、`resolve_entities=False`、YAML 环境变量注入、
+  f-string 白名单表名 vs `request.args` 用户输入）
+- `tests/test_audit_fixes.py` —— 外部审计的验收场景：红基线不误判、自定义规则
+  finding_gone 不恒真、`--exclude` 的 `**` 语义、编造证据被打回、路径穿越与
+  符号链接被拒绝、测试子进程环境变量剥离、`scan -o` 与 `--fail-on-findings`
 
 跑法不依赖 pytest。
 

@@ -23,9 +23,38 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .detect import SKIP_DIRS, detect_language, scan_file, scan_tree
+from .detect import SKIP_DIRS, Rule, detect_language, scan_file, scan_tree
 from .io_utils import read_source, write_source
 from .models import Finding, PatchAttempt
+
+
+def safe_join(root: Path, rel: str) -> Path:
+    """把模型/外部输入给出的相对路径安全地拼到项目根下。
+
+    模型返回的 file 字段是不可信输入（可能来自仓库里的提示注入，
+    也可能只是幻觉）。不校验的话 `../../.env` 或绝对路径会让读写越出项目根，
+    而且这在**验证阶段**就会发生，不需要 --apply。
+    """
+    rel = str(rel)
+    if Path(rel).is_absolute() or (len(rel) > 1 and rel[1] == ":"):
+        raise ValueError(f"拒绝绝对路径: {rel}")
+    root_resolved = root.resolve()
+    target = (root_resolved / rel).resolve()
+    if target != root_resolved and root_resolved not in target.parents:
+        raise ValueError(f"路径越出项目根: {rel}")
+    return target
+
+
+def _write_guard(target: Path, root: Path, rel: str) -> None:
+    """写盘前的最后防线：越界路径与符号链接一律拒绝。
+
+    符号链接必须拦：恶意仓库可以把被扫描文件做成指向 ~/.bashrc 的软链，
+    验证在副本里通过（副本按内容复制），落盘时却写到链接目标。
+    """
+    if target.is_symlink() or os.path.islink(target):
+        raise ValueError(f"拒绝写入符号链接: {rel}")
+    if is_protected(rel):
+        raise ValueError(f"拒绝写入受保护文件: {rel}")
 
 
 @dataclass
@@ -145,8 +174,12 @@ def replace_once(source: str, old: str, new: str) -> str | None:
 _TEST_DIR_NAMES = {"tests", "test", "__tests__", "spec", "specs", "testdata"}
 _PROTECTED_FILENAMES = {
     "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "setup.cfg",
-    "package.json", "pyproject.toml", "Makefile", "jest.config.js",
-    "jest.config.ts", "vitest.config.ts", "go.mod", "Cargo.toml",
+    "package.json", "pyproject.toml", "makefile", "jest.config.js",
+    "jest.config.ts", "vitest.config.ts", "go.mod", "cargo.toml",
+    # 构建/依赖/环境配置：改动它们可能直接改变构建产物或引入恶意依赖
+    "setup.py", "requirements.txt", "dockerfile", "docker-compose.yml",
+    "docker-compose.yaml", ".gitlab-ci.yml", ".pre-commit-hooks.yaml",
+    ".pre-commit-config.yaml", "pdm.lock", "poetry.lock", "package-lock.json",
 }
 
 
@@ -154,8 +187,10 @@ def is_protected(rel_path: str) -> bool:
     """判断这条路径是否禁止被补丁修改。
 
     这是整套验证的命门：`tests_pass` 之所以可信，前提是测试本身没被动过。
-    模型完全可以「改测试让它变绿」——实测中它真的这么干了，去改
-    test_fingerprint_is_stable 的断言。所以这一层必须是硬拦截，不能只靠 prompt。
+    模型完全可以「改测试让它变绿」，所以这一层必须是硬拦截，不能只靠 prompt。
+
+    比较一律小写化：Windows 上 `.GITHUB/`、`.Github/` 与 `.github/` 是同一个目录，
+    大小写敏感的判断等于给绕过留了门。
     """
     p = rel_path.replace("\\", "/")
     while p.startswith("./"):
@@ -164,18 +199,27 @@ def is_protected(rel_path: str) -> bool:
     if not parts:
         return False
 
-    name = parts[-1]
-    if any(part.lower() in _TEST_DIR_NAMES for part in parts[:-1]):
+    # 仓库元数据永远不许碰
+    lowered_parts = [part.lower() for part in parts]
+    if ".git" in lowered_parts:
+        return True
+
+    name = lowered_parts[-1]
+    if any(part in _TEST_DIR_NAMES for part in lowered_parts[:-1]):
         return True
     if name in _PROTECTED_FILENAMES:
         return True
-    if parts[0] in {".github", ".gitlab", ".circleci"}:
+    if lowered_parts[0] in {".github", ".gitlab", ".circleci"}:
+        return True
+    # 密钥与环境文件
+    if name == ".env" or name.startswith(".env."):
+        return True
+    if name.endswith((".pem", ".key", ".p12", ".pfx")) or name == "id_rsa":
         return True
 
-    lowered = name.lower()
-    if lowered.startswith("test_") or lowered.startswith("test-"):
+    if name.startswith("test_") or name.startswith("test-"):
         return True
-    return lowered.endswith((
+    return name.endswith((
         "_test.py", "_test.go", ".test.js", ".test.ts", ".test.tsx",
         ".spec.js", ".spec.ts", ".spec.tsx", "_spec.rb",
     ))
@@ -200,8 +244,8 @@ class PatchSession:
         out: dict[str, str] = {}
         for rel in rel_paths:
             try:
-                text = read_source(self.root / rel)
-            except OSError:
+                text = read_source(safe_join(self.root, rel))
+            except (OSError, ValueError):
                 return None
             for proposal in self.proposals:
                 for edit in proposal.edits:
@@ -238,11 +282,40 @@ class PatchSession:
 # ---------------------------------------------------------------- 语法/编译检查
 
 
+# 子进程会执行**被审计仓库自己的测试代码**，那等于执行任意代码。
+# 环境变量默认全继承，等于把 BEE_LLM_API_KEY / 云凭据白送出去。
+# 这里按名字模式剥离敏感项，只给测试进程一个最小环境。
+_ENV_DENY_EXACT = {
+    "GITHUB_TOKEN", "GH_TOKEN", "OPENAI_API_KEY", "ANTHROPIC_API_KEY",
+    "DEEPSEEK_API_KEY", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN", "GOOGLE_APPLICATION_CREDENTIALS",
+}
+_ENV_DENY_SUFFIX = ("_KEY", "_TOKEN", "_SECRET", "_PASSWORD", "_CREDENTIALS")
+_ENV_DENY_PREFIX = ("BEE_LLM_", "AWS_", "AZURE_", "GCLOUD_", "ALIYUN_")
+
+
+def sanitized_env() -> dict[str, str]:
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        upper = key.upper()
+        if upper in _ENV_DENY_EXACT:
+            continue
+        if upper.startswith(_ENV_DENY_PREFIX):
+            continue
+        if upper.endswith(_ENV_DENY_SUFFIX):
+            continue
+        env[key] = value
+    # 防止测试代码把真实 home 下的配置/凭据当默认输入读走
+    env["BEE_ISOLATED_TEST"] = "1"
+    return env
+
+
 def _run(cmd: list[str], cwd: Path, timeout: int) -> tuple[int, str]:
     try:
         proc = subprocess.run(
             cmd, cwd=str(cwd), capture_output=True, text=True,
             timeout=timeout, encoding="utf-8", errors="replace",
+            env=sanitized_env(),
         )
         return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
     except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
@@ -333,19 +406,22 @@ def detect_test_command(root: Path) -> list[str] | None:
     """探测项目自带的测试入口。
 
     顺序上先试 pytest（生态最广），再退到 unittest（标准库，不需要额外装包）。
-    有测试才能验证「补丁没踩坏别的功能」，这一项缺了，
-    补丁就只能验证到语法层——报告里会明确写出来。
+    每个分支都先确认解释器/命令真的可用——直接返回一个跑不起来的命令，
+    只会让结果变成「环境失败」而不是「没有测试」。
     """
-    if (root / "pytest.ini").exists() or (root / "conftest.py").exists():
-        return [sys.executable, "-m", "pytest", "-x", "-q"]
-    if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+    def _pytest_available() -> bool:
         code, _ = _run([sys.executable, "-m", "pytest", "--version"], root, 30)
-        if code == 0:
+        return code == 0
+
+    if (root / "pytest.ini").exists() or (root / "conftest.py").exists():
+        if _pytest_available():
+            return [sys.executable, "-m", "pytest", "-x", "-q"]
+    if (root / "pyproject.toml").exists() or (root / "setup.py").exists():
+        if _pytest_available():
             return [sys.executable, "-m", "pytest", "-x", "-q"]
 
     if (root / "tests").is_dir() or (root / "test").is_dir():
-        code, _ = _run([sys.executable, "-m", "pytest", "--version"], root, 30)
-        if code == 0:
+        if _pytest_available():
             return [sys.executable, "-m", "pytest", "-x", "-q"]
 
     # unittest 兜底：不依赖第三方包
@@ -360,10 +436,13 @@ def detect_test_command(root: Path) -> list[str] | None:
     if pkg.exists():
         try:
             if '"test"' in pkg.read_text(encoding="utf-8", errors="replace"):
-                return ["npm", "test", "--silent"]
+                # Windows 上 npm 是 npm.cmd，subprocess 直接执行 "npm" 会 127
+                npm = shutil.which("npm") or shutil.which("npm.cmd")
+                if npm:
+                    return [npm, "test", "--silent"]
         except OSError:
             pass
-    if (root / "go.mod").exists():
+    if (root / "go.mod").exists() and shutil.which("go"):
         return ["go", "test", "./..."]
     return None
 
@@ -420,6 +499,7 @@ def verify_patch(
     *,
     run_tests: bool = True,
     base_texts: dict[str, str] | None = None,
+    rules: list[Rule] | None = None,
 ) -> PatchAttempt:
     involved = proposal.files() or [finding.path]
 
@@ -439,8 +519,8 @@ def verify_patch(
             texts[rel] = base_texts[rel]
             continue
         try:
-            texts[rel] = read_source(root / rel)
-        except OSError as exc:
+            texts[rel] = read_source(safe_join(root, rel))
+        except (OSError, ValueError) as exc:
             attempt.errors.append(f"无法读取 {rel}: {exc}")
             return attempt
 
@@ -473,17 +553,22 @@ def verify_patch(
     attempt.applied = True
 
     # --- 3. 重扫判定漏洞是否消失
+    # 注意两点：
+    # - 临时目录里必须保留相对路径层级。按 basename 平铺会让 src/a/models.py
+    #   和 src/b/models.py 互相覆盖，跨文件补丁的结论就不可信。
+    # - 必须传同一个 rules 集合。用默认内置规则重扫自定义规则的 finding，
+    #   结果永远是空 → finding_gone 恒真 → 空补丁也能被判「已验证修复」。
     tmp_scan_dir = Path(tempfile.mkdtemp(prefix="bee-scan-"))
     try:
         for rel in involved:
-            probe = tmp_scan_dir / Path(rel).name
+            probe = tmp_scan_dir / rel
             probe.parent.mkdir(parents=True, exist_ok=True)
             write_source(probe, patched[rel])
         remaining: list[Finding] = []
         for rel in involved:
-            probe = tmp_scan_dir / Path(rel).name
+            probe = tmp_scan_dir / rel
             remaining.extend(
-                f for f in scan_file(probe, tmp_scan_dir) if f.rule_id == finding.rule_id
+                f for f in scan_file(probe, tmp_scan_dir, rules) if f.rule_id == finding.rule_id
             )
         attempt.finding_gone = len(remaining) == 0
         if not attempt.finding_gone:
@@ -498,7 +583,7 @@ def verify_patch(
     try:
         workdir = _copy_project(root)
         for rel in involved:
-            write_source(workdir / rel, patched[rel])
+            write_source(safe_join(workdir, rel), patched[rel])
 
         ok = True
         checked_any = False
@@ -517,23 +602,30 @@ def verify_patch(
 
         attempt.compiles = ok
         attempt.compile_checked = checked_any
+        if not checked_any:
+            attempt.notes.append(
+                "当前环境没有对应语言的语法检查器，本次未做语法校验（compiles 不代表已编译通过）"
+            )
 
         if run_tests and ok:
             baseline = _test_baseline(root)
             cmd = detect_test_command(workdir)
-            if baseline is None or cmd is None:
+            if cmd is None or baseline is None:
                 attempt.tests_pass = None
-                if baseline is None:
-                    attempt.notes.append(
-                        "项目自带的测试在未打补丁时就无法通过（常见原因：缺依赖、缺环境变量），"
-                        "因此跳过回归判定，只验证到语法层"
-                    )
-                else:
-                    attempt.notes.append("未发现测试套件，跳过回归测试")
+                attempt.notes.append("未发现可用测试套件，只验证到语法层")
+            elif baseline is False:
+                # 项目原有测试就是红的（或缺依赖跑不起来）。这种情况下打补丁后
+                # 测试仍然非 0 是**既有事实**，不能记成「补丁破坏了功能」。
+                attempt.tests_pass = None
+                attempt.notes.append(
+                    "未打补丁时项目测试就已失败/无法运行，回归信号不可用；"
+                    "本次不按「补丁破坏功能」计，需人工确认测试影响"
+                )
             else:
                 code, out = _run(cmd, workdir, 600)
                 attempt.tests_pass = code == 0
                 if code != 0:
+                    # 基线是绿的、打补丁后变红，这才是补丁引入的失败
                     attempt.errors.append(f"测试失败（{' '.join(cmd)}）: {out.strip()[:600]}")
     finally:
         if workdir is not None:
@@ -542,29 +634,32 @@ def verify_patch(
     return attempt
 
 
-def finding_still_present(finding: Finding, base_text: str, root: Path) -> bool:
+def finding_still_present(
+    finding: Finding, base_text: str, root: Path, rules: list[Rule] | None = None
+) -> bool:
     """在可能已被部分修补的文本上重扫，判断该漏洞是否还存在。
 
     用于区分「修复失败」和「已被前一条补丁顺带修掉」。
-    后者很常见：一条补丁把相邻两行凭据一起改成环境变量读取，
-    另一条 finding 指向的第二行自然就消失了，这不叫失败。
+    rules 必须与最初检测时一致，否则自定义规则永远扫不到，
+    会把「仍在」误判成「已被覆盖」。
     """
     tmp = Path(tempfile.mkdtemp(prefix="bee-check-"))
     try:
-        probe = tmp / Path(finding.path).name
+        probe = tmp / finding.path
+        probe.parent.mkdir(parents=True, exist_ok=True)
         write_source(probe, base_text)
-        hits = [f for f in scan_file(probe, tmp) if f.rule_id == finding.rule_id]
+        hits = [f for f in scan_file(probe, tmp, rules) if f.rule_id == finding.rule_id]
         return len(hits) > 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def rescan_after_edit(root: Path, rel_path: str, rule_id: str) -> list[Finding]:
+def rescan_after_edit(root: Path, rel_path: str, rule_id: str, rules: list[Rule] | None = None) -> list[Finding]:
     """对外暴露：对已落盘的文件重扫某条规则。"""
-    target = root / rel_path
+    target = safe_join(root, rel_path)
     if not target.exists():
         return []
-    return [f for f in scan_file(target, root) if f.rule_id == rule_id]
+    return [f for f in scan_file(target, root, rules) if f.rule_id == rule_id]
 
 
 def collect_baseline(root: Path) -> list[Finding]:
@@ -593,7 +688,12 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
     errors: list[str] = []
 
     for rel in order:
-        target = root / rel
+        try:
+            target = safe_join(root, rel)
+            _write_guard(target, root, rel)
+        except ValueError as exc:
+            errors.append(f"{rel}: {exc}")
+            continue
         try:
             text = read_source(target)
         except OSError as exc:
@@ -612,7 +712,10 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
             continue
 
         backup = target.with_suffix(target.suffix + ".bee.bak")
-        shutil.copy2(target, backup)
+        if backup.is_symlink() or os.path.islink(backup):
+            errors.append(f"{rel}: 备份路径是符号链接，已跳过")
+            continue
+        shutil.copy2(target, backup, follow_symlinks=False)
         write_source(target, text)
         written += 1
 
@@ -621,25 +724,47 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
 
 def apply_to_disk(root: Path, proposal: EditProposal) -> bool:
     """单条落盘，保留给脚本化场景。先备份原文件。"""
-    patched = proposal.apply_to({rel: read_source(root / rel) for rel in proposal.files()})
+    try:
+        patched = proposal.apply_to({rel: read_source(safe_join(root, rel)) for rel in proposal.files()})
+    except (OSError, ValueError):
+        return False
     if patched is None:
         return False
     for rel, text in patched.items():
-        target = root / rel
+        try:
+            target = safe_join(root, rel)
+            _write_guard(target, root, rel)
+        except ValueError:
+            return False
         backup = target.with_suffix(target.suffix + ".bee.bak")
-        shutil.copy2(target, backup)
+        if backup.is_symlink() or os.path.islink(backup):
+            return False
+        shutil.copy2(target, backup, follow_symlinks=False)
         write_source(target, text)
     return True
 
 
-def cleanup_stale_temp() -> int:
-    """清理异常退出遗留的临时目录。"""
+def cleanup_stale_temp(max_age_hours: float = 24.0) -> int:
+    """清理异常退出遗留的临时目录（默认只清超过 24 小时的）。
+
+    副本里可能含 .env、密钥文件，不能长期留在系统 temp。
+    只清「足够旧」的，避免误删另一个正在运行的 bee 进程的副本。
+    """
+    import time
+
     base = Path(tempfile.gettempdir())
+    cutoff = time.time() - max_age_hours * 3600
     removed = 0
     for p in base.glob("bee-*"):
-        if p.is_dir():
+        try:
+            if not p.is_dir() or p.is_symlink():
+                continue
+            if p.stat().st_mtime > cutoff:
+                continue
             shutil.rmtree(p, ignore_errors=True)
             removed += 1
+        except OSError:
+            continue
     return removed
 
 

@@ -101,6 +101,40 @@ def _parse_json(raw: str) -> dict:
     return json.loads(text)
 
 
+_EVIDENCE_RE = re.compile(r"^\s*L(\d+)\s*[:：]\s*\S+")
+
+
+def _import_region_end(source_lines: list[str]) -> int:
+    """模块顶部 import 区的结束行号。
+
+    修复经常要动 import（补 io/subprocess），所以证据允许指向 import 区，
+    但不能借此放开到整个文件——那等于没有距离约束。
+    """
+    end = 0
+    for idx, line in enumerate(source_lines[:200], 1):
+        stripped = line.strip()
+        if re.match(r"(?:def|class|async\s+def)\s", stripped):
+            break
+        if stripped.startswith(("import ", "from ")):
+            end = idx
+    return end
+
+
+def _shown_line_numbers(ctx: CodeContext) -> set[int]:
+    """从装配好的 prompt 里抽出所有真实出现过的行号。
+
+    校验的语义是「只能引用提供给你的代码」——prompt 的每个代码块都带
+    `_numbered` 行号前缀（含跨文件调用方各自的行号），所以这里抽出的集合
+    就是允许引用的全集。比「函数范围」更准：related_definitions、调用方
+    片段里的行同样是合法证据，而从未展示过的行号一律是编造。
+    """
+    try:
+        prompt = ctx.to_prompt()
+    except Exception:
+        return set()
+    return {int(x) for x in re.findall(r"^\s*(\d+)\s*\|", prompt, re.M)}
+
+
 def _validate(
     expl: Explanation,
     finding: Finding,
@@ -114,21 +148,50 @@ def _validate(
     if not expl.evidence:
         problems.append("evidence 为空，必须给出指向具体行号的证据")
 
-    # 行号范围校验：模型只能引用实际提供给它的那段代码
     lo, hi = ctx.line_range()
+    import_end = _import_region_end(source_lines)
+    shown = _shown_line_numbers(ctx)
+    caller_lines = {c.line for c in (getattr(ctx, "callers", None) or [])}
+    malformed: list[str] = []
     fake: list[str] = []
     for item in expl.evidence:
-        m = re.match(r"\s*L(\d+)", item)
+        m = _EVIDENCE_RE.match(item)
         if not m:
+            # 不匹配「L行号: 结论」的一律判不合格。以前这里是 continue 静默放过，
+            # 等于 evidence=["我编的"] 也能通过，反幻觉机制形同虚设。
+            malformed.append(item)
             continue
         line_no = int(m.group(1))
-        if not (1 <= line_no <= max(1, len(source_lines))):
-            fake.append(item)
-        elif not (lo - 1 <= line_no <= hi + 1):
-            fake.append(item)
+        in_caller = any(abs(line_no - cl) <= 1 for cl in caller_lines)
+
+        if shown:
+            # 主路径：行号必须真的出现在提供给模型的代码里
+            if line_no not in shown:
+                fake.append(f"{item}（该行号未出现在提供的代码中）")
+                continue
+        else:
+            # 兜底（上下文未编号时）：函数范围 + import 区 + 已登记调用方
+            in_function = lo - 1 <= line_no <= hi + 1
+            in_imports = import_end > 0 and line_no <= import_end
+            if not (in_function or in_imports or in_caller):
+                fake.append(
+                    f"{item}（不在漏洞函数 L{lo}-L{hi}、import 区或已识别的调用方行内）"
+                )
+                continue
+
+        # 引用目标文件本身的行时，还要求该行非空（空行不能支撑任何结论）
+        if 1 <= line_no <= len(source_lines) and not in_caller:
+            if not source_lines[line_no - 1].strip():
+                fake.append(f"{item}（该行是空行，不能作为证据）")
+
+    if malformed:
+        problems.append(
+            "以下证据不符合「L行号: 结论」格式，必须重写为带真实行号的形式："
+            + "；".join(malformed[:3])
+        )
     if fake:
         problems.append(
-            f"以下证据引用的行号不在提供的代码范围 L{lo}-L{hi} 内，属于编造："
+            "以下证据的行号无效（须引用提供给你的代码里的非空行）："
             + "；".join(fake[:3])
         )
 
@@ -190,13 +253,27 @@ def explain(
             failure = f"返回内容不是合法 JSON（{exc}）。请只输出 JSON 对象。"
             continue
 
+        try:
+            confidence = float(data.get("confidence", 0) or 0)
+        except (TypeError, ValueError):
+            # 模型偶尔返回 "high" 这类文本，不能因为一个字段就把整条分析炸掉
+            confidence = 0.0
+        raw_evidence = data.get("evidence")
+        if isinstance(raw_evidence, list):
+            evidence = [str(x) for x in raw_evidence][:6]
+        elif isinstance(raw_evidence, str) and raw_evidence.strip():
+            evidence = [raw_evidence.strip()]
+        else:
+            # 不是列表/字符串时给空，让 _validate 判不合格，而不是把字符串拆成单字符
+            evidence = []
+
         expl = Explanation(
             root_cause=str(data.get("root_cause", "")).strip(),
             attack_path=str(data.get("attack_path", "")).strip(),
             impact=str(data.get("impact", "")).strip(),
             fix_rationale=str(data.get("fix_rationale", "")).strip(),
-            confidence=float(data.get("confidence", 0) or 0),
-            evidence=[str(x) for x in (data.get("evidence") or [])][:6],
+            confidence=confidence,
+            evidence=evidence,
         )
         problems = _validate(expl, finding, lines, ctx)
         if not problems:
@@ -204,10 +281,18 @@ def explain(
         best = expl
         failure = "；".join(problems)
 
-    return best or _fallback_explanation(finding)
+    if best is not None:
+        # 两轮仍不合格：结果可以进报告，但必须标记降级，
+        # 由调用方决定不再把它当「已确认根因」喂给补丁生成。
+        best.degraded = True
+        best.degrade_reason = failure or "证据校验未通过"
+        return best
+    return _fallback_explanation(finding)
 
 
 def _fallback_explanation_with_error(finding: Finding, error: str) -> Explanation:
     expl = _fallback_explanation(finding)
     expl.root_cause += f"\n\n（LLM 分析失败，已降级为规则先验：{error[:200]}）"
+    expl.degraded = True
+    expl.degrade_reason = f"LLM 分析失败：{error[:120]}"
     return expl

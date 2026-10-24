@@ -1,8 +1,8 @@
-"""检测层：规则引擎 + LLM 语义审计双通道。
+"""检测层：可插拔的规则引擎。
 
-为什么不用 semgrep：Windows 环境下 semgrep 依赖 WSL 或 Docker，两者都不可靠。
-自建规则引擎有额外好处 —— 每条规则自带 root_cause_hint / fix_hint，
-这是可解释性分析的先验知识，比纯正则信号强得多。
+默认使用内置规则（零依赖、离线），也可通过 semgrep_backend 合并外部 semgrep
+结果。内置规则自带 root_cause_hint / fix_hint，这是可解释性分析的先验知识，
+比纯正则信号强得多。
 
 设计取舍：宁可少而准。误报会摧毁可解释性修复的可信度，
 因为你会花半页篇幅解释一个根本不存在的漏洞。
@@ -159,7 +159,12 @@ BUILTIN_RULES: list[Rule] = _r(
         owasp=["A02:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php"],
         pattern=r"""(?is)\b(?:hashlib\.(?:md5|sha1)|MessageDigest\.getInstance\s*\(\s*["'](?:MD5|SHA-?1)|createHash\s*\(\s*["'](?:md5|sha1)|crypto\.(?:MD5|SHA1)|(?:md5|sha1)\.(?:New|Sum)|crypto\.createHash\s*\(\s*["']md5)""",
-        safe_when=[],
+        safe_when=[
+            # 显式声明非安全用途的哈希（Python 3.9+ 的标准做法），不该报。
+            # 不用 "fingerprint" 这类词做窗口匹配——±600 字符窗口里出现一次
+            # 就会压制真实命中，宁可窄不可宽。
+            r"(?i)usedforsecurity\s*=\s*False",
+        ],
         root_cause_hint="MD5/SHA-1 已被证明存在实用碰撞攻击，不能用于完整性校验或凭据存储。",
         fix_hint="换 SHA-256 及以上；口令存储用 bcrypt/scrypt/argon2 而非任何裸哈希。",
         references=["https://cwe.mitre.org/data/definitions/327.html"],
@@ -481,6 +486,54 @@ SKIP_DIRS = {
 
 MAX_FILE_BYTES = 800_000
 
+_GLOB_CACHE: dict[str, re.Pattern] = {}
+
+
+def glob_to_regex(pattern: str) -> re.Pattern:
+    """把 glob 转成正则，**正确处理 `**`**。
+
+    fnmatch 的 `*` 会跨过 `/`，`Path.match` 又不支持递归 `**`，
+    所以 `tests/**`、`src/**/*.py` 这两种最常用写法在它们手上都会失效。
+    这里统一语义：
+      `*`   → 不跨目录的任意字符
+      `**`  → 跨目录的任意字符（`**/` 可以匹配零层目录）
+      `?`   → 单个非 `/` 字符
+    """
+    if pattern in _GLOB_CACHE:
+        return _GLOB_CACHE[pattern]
+    pat = pattern.replace("\\", "/").lstrip("./")
+    out: list[str] = []
+    i = 0
+    while i < len(pat):
+        ch = pat[i]
+        if ch == "*":
+            if pat.startswith("**/", i):
+                out.append("(?:.*/)?")
+                i += 3
+            elif pat.startswith("**", i):
+                out.append(".*")
+                i += 2
+            else:
+                out.append("[^/]*")
+                i += 1
+        elif ch == "?":
+            out.append("[^/]")
+            i += 1
+        else:
+            out.append(re.escape(ch))
+            i += 1
+    compiled = re.compile("^" + "".join(out) + "$")
+    _GLOB_CACHE[pattern] = compiled
+    return compiled
+
+
+def matches_globs(rel_path: str, patterns: list[str] | None) -> bool:
+    """rel_path 用 / 分隔的相对路径，判断是否命中任一 glob。"""
+    if not patterns:
+        return False
+    rel = rel_path.replace("\\", "/").lstrip("./")
+    return any(glob_to_regex(g).match(rel) for g in patterns if g and g.strip())
+
 
 def detect_language(path: Path) -> str:
     if path.name == ".env" or path.suffix == ".env":
@@ -488,18 +541,28 @@ def detect_language(path: Path) -> str:
     return EXT_LANG.get(path.suffix.lower(), "")
 
 
-def iter_source_files(root: Path, include_globs: list[str] | None = None) -> list[Path]:
+def iter_source_files(
+    root: Path,
+    include_globs: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
+) -> list[Path]:
     files: list[Path] = []
     for p in root.rglob("*"):
         if not p.is_file():
             continue
         if any(part in SKIP_DIRS for part in p.parts):
             continue
-        if p.stat().st_size > MAX_FILE_BYTES:
+        try:
+            if p.stat().st_size > MAX_FILE_BYTES:
+                continue
+        except OSError:
             continue
         if not detect_language(p):
             continue
-        if include_globs and not any(p.match(g) for g in include_globs):
+        rel = str(p.relative_to(root)).replace("\\", "/")
+        if include_globs and not matches_globs(rel, include_globs):
+            continue
+        if exclude_globs and matches_globs(rel, exclude_globs):
             continue
         files.append(p)
     return sorted(files)
@@ -622,10 +685,26 @@ def _detect_sql_flow(text: str, rel: str) -> list[Finding]:
     """
     findings: list[Finding] = []
     assigned: dict[str, tuple[int, str]] = {}
+    # 安全标识符：来自字典查找（TABLES[key]）或纯字符串常量（"orders"）的变量。
+    # SQL 文本里只插值这种标识符 + 用户数据走占位符，是参数化查询的标准补法。
+    safe_idents: set[str] = set()
+
+    def _is_safe_ident_rhs(rhs: str) -> bool:
+        r = rhs.strip()
+        if re.match(r"""^["'][^"'{}]*["']$""", r):
+            return True  # 纯字符串常量
+        # 映射查找只认常量风格名字（TABLES[key] / {"a":"b"}[k]）：
+        # request.args["table"] 同样是下标访问，但那是用户输入，不能当白名单。
+        if re.match(r"^(?:[A-Z_][A-Z0-9_]*|\{.*\})\s*\[", r):
+            return True
+        return False
 
     for line_no, chunk in _logical_lines(text):
         for m in ASSIGN_RE.finditer(chunk):
             var, rhs = m.group(1), m.group(2)
+            name = var.split(".")[-1]
+            if _is_safe_ident_rhs(rhs):
+                safe_idents.add(name)
             actual_line = line_no + chunk.count("\n", 0, m.start())
             if not SQL_KEYWORD_RE.search(rhs):
                 continue
@@ -634,7 +713,7 @@ def _detect_sql_flow(text: str, rel: str) -> list[Finding]:
             # 参数化写法已在右侧显式分离，不算注入
             if re.search(r"(?i)\?\s*,\s*\(|%s\s*\)\s*,\s*\(|:\w+\s*,", rhs):
                 continue
-            assigned[var.split(".")[-1]] = (actual_line, rhs)
+            assigned[name] = (actual_line, rhs)
 
     if not assigned:
         return findings
@@ -648,6 +727,17 @@ def _detect_sql_flow(text: str, rel: str) -> list[Finding]:
             text,
         )
         if not sink:
+            continue
+        # 汇点是参数绑定（execute(sql, params)）且 SQL 文本里的插值全部来自
+        # 安全标识符（字典查找/常量）时不算注入。反例——
+        # f"... '{name}' ... ?" + params 依然是注入，name 不在 safe_idents 里就继续报。
+        open_idx = text.find("(", sink.start())
+        interpolations = set(re.findall(r"\{(\w+)", rhs))
+        if (
+            len(_split_call_args(text, open_idx)) >= 2
+            and interpolations
+            and interpolations <= safe_idents
+        ):
             continue
         findings.append(
             Finding(
@@ -797,8 +887,9 @@ def scan_tree(
     rules: list[Rule] | None = None,
     include_globs: list[str] | None = None,
     only_paths: list[str] | None = None,
+    exclude_globs: list[str] | None = None,
 ) -> list[Finding]:
-    targets = iter_source_files(root, include_globs)
+    targets = iter_source_files(root, include_globs, exclude_globs)
     if only_paths:
         wanted = {p.replace("\\", "/") for p in only_paths}
         targets = [p for p in targets if str(p.relative_to(root)).replace("\\", "/") in wanted]
@@ -806,7 +897,7 @@ def scan_tree(
     findings: list[Finding] = []
     for f in targets:
         findings.extend(scan_file(f, root, rules))
-    # 同文件同规则相邻行合并噪音
+    # 按文件/行号/规则排序，保证输出稳定（不做跨行合并）
     findings.sort(key=lambda x: (x.path, x.start_line, x.rule_id))
     return findings
 
@@ -814,15 +905,16 @@ def scan_tree(
 def merge_findings(primary: list[Finding], secondary: list[Finding]) -> list[Finding]:
     """合并两个后端的检测结果。
 
-    同一位置两个后端都报了，只留一条：优先严重级别高的，
+    同一「文件 + 行号 + 规则」两个后端都报了，只留一条：优先严重级别高的，
     同级时优先保留带污点路径的（信息更多，可解释性更好）。
-    不做这层合并，报告里同一行会出现两遍，评审时很碍事。
+    注意必须带规则名去重：同一行完全可能同时存在两种漏洞
+    （例如一行里既有拼接 SQL 又有硬编码凭据），按位置去重会丢掉其中一种。
     """
     rank = {Severity.INFO: 0, Severity.WARNING: 1, Severity.ERROR: 2}
-    best: dict[tuple[str, int], Finding] = {}
+    best: dict[tuple[str, int, str], Finding] = {}
 
     for finding in list(primary) + list(secondary):
-        key = (finding.path, finding.start_line)
+        key = (finding.path, finding.start_line, finding.rule_id)
         current = best.get(key)
         if current is None:
             best[key] = finding
@@ -836,7 +928,12 @@ def merge_findings(primary: list[Finding], secondary: list[Finding]) -> list[Fin
 
 
 def load_custom_rules(path: Path) -> list[Rule]:
-    """加载用户自定义规则：Python 文件里定义 RULES 列表。"""
+    """加载用户自定义规则：Python 文件里定义 RULES 列表。
+
+    安全提示：这会**执行该文件的 Python 代码**（import 语义），
+    与 `python your_rules.py` 等价。只加载自己写的规则文件，
+    不要加载第三方仓库里附带的、未审阅的规则文件。
+    """
     import importlib.util
 
     spec = importlib.util.spec_from_file_location("bee_custom_rules", path)

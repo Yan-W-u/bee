@@ -24,6 +24,17 @@ from .models import Finding, Severity, TraceStep
 
 _SEMGREP_TIMEOUT = 900
 
+# docker 模式固定镜像版本（:latest 会被上游随时更换，结果不可复现，
+# 也等于每次把未审计的第三方镜像放进执行环境）。
+# 需要换版本时用环境变量 BEE_SEMGREP_IMAGE 覆盖。
+SEMGREP_IMAGE_DEFAULT = "returntocorp/semgrep:1.182.0"
+
+
+def _semgrep_image() -> str:
+    import os
+
+    return os.environ.get("BEE_SEMGREP_IMAGE") or SEMGERP_IMAGE_DEFAULT
+
 
 def _run(cmd: list[str], cwd: Path | None = None, timeout: int = 60) -> tuple[int, str]:
     try:
@@ -60,13 +71,14 @@ def _build_command(
     if mode == "local":
         return prefix + ["--json", "--quiet", "--config", config, target_rel]
 
-    # docker：把项目目录挂进 /src，semgrep 在容器内的路径都是 /src 下
-    mount = f"{root.resolve()}:/src"
+    # docker：把项目目录**只读**挂进 /src，semgrep 在容器内的路径都是 /src 下。
+    # :ro 是必须的——不给它写宿主仓库的权限，扫描本来也不该写。
+    mount = f"{root.resolve()}:/src:ro"
     return prefix + [
         "run", "--rm",
         "-v", mount,
         "-w", "/src",
-        "returntocorp/semgrep:latest",
+        _semgrep_image(),
         "semgrep", "--json", "--quiet", "--config", config, target_rel,
     ]
 

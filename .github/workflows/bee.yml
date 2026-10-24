@@ -12,6 +12,24 @@ permissions:
   pull-requests: write
 
 jobs:
+  self-check:
+    name: 单元测试 + 规则 benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      # 每次 push 都跑。改规则/验证层时这里的红比扫描结果先到，
+      # 不必等到每周一的全量工作流。
+      - name: 单元测试
+        run: python -m unittest discover -s tests -v
+
+      - name: 规则 benchmark（有 FN/FP 则失败）
+        run: python benchmark/run.py --strict
+
   scan:
     name: 漏洞扫描
     runs-on: ubuntu-latest

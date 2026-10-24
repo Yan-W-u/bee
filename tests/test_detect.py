@@ -91,6 +91,34 @@ class TestSuppression(unittest.TestCase):
                                             "    return db.execute(\"SELECT * FROM t WHERE n LIKE ?\", (\"%\" + kw + \"%\",))\n")
         self.assertNotIn("bee.sql-injection", hits)
 
+    def test_fstring_whitelist_table_with_params_is_silent(self):
+        """f-string 只拼白名单表名 + 用户输入走占位符，是安全写法。"""
+        hits = scan_snippet("safe_whitelist.py",
+                            "TABLES = {'orders': 'orders'}\n"
+                            "\n"
+                            "def find(conn, key, kw):\n"
+                            "    table = TABLES[key]\n"
+                            "    sql = f\"SELECT id FROM {table} WHERE note LIKE ?\"\n"
+                            "    return conn.execute(sql, (\"%\" + kw + \"%\",)).fetchall()\n")
+        self.assertNotIn("bee.sql-injection", hits)
+
+    def test_concat_sql_with_params_still_flagged(self):
+        """多参数不等于安全：SQL 文本里混着用户输入，加 params 也没用。"""
+        hits = scan_snippet("bad_params.py",
+                            "def find(conn, name):\n"
+                            "    sql = f\"SELECT * FROM t WHERE n = '{name}' AND x = ?\"\n"
+                            "    return conn.execute(sql, (1,)).fetchall()\n")
+        self.assertIn("bee.sql-injection", hits)
+
+    def test_request_arg_table_still_flagged(self):
+        """request.args['table'] 也是下标访问，但那是用户输入，不能当白名单。"""
+        hits = scan_snippet("bad_table.py",
+                            "def find(conn, request):\n"
+                            "    table = request.args['table']\n"
+                            "    sql = f\"SELECT * FROM {table} WHERE id = ?\"\n"
+                            "    return conn.execute(sql, (1,)).fetchall()\n")
+        self.assertIn("bee.sql-injection", hits)
+
     def test_php_concat_is_flagged(self):
         hits = scan_snippet("bad.php", "<?php\n"
                                        "$sql = \"SELECT * FROM u WHERE id = \" . $_GET['id'];\n"
