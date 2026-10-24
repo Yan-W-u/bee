@@ -312,6 +312,18 @@ def _make_results(
         _progress(f"检测后端：{note}")
 
     findings = [f for f in findings if SEV_ORDER[f.severity] >= SEV_ORDER[Severity(args.min_severity.upper())]]
+
+    # 基线过滤对 audit/fix 同样生效：CI 里 audit 也要只处理新增问题，
+    # 否则接入 LLM 后会为几百条历史问题付费。
+    if getattr(args, "baseline", None):
+        try:
+            baseline_obj = baseline.load(args.baseline)
+        except (OSError, ValueError) as exc:
+            _progress(f"基线文件无法读取: {exc}")
+            return [], len(files)
+        findings, known = baseline.split(findings, baseline_obj)
+        _progress(f"基线：已存在 {len(known)} 条，本次新增 {len(findings)} 条")
+
     if args.limit:
         findings = findings[: args.limit]
 
@@ -433,6 +445,12 @@ def _emit(args: argparse.Namespace, results: list[RepairResult], target: Path, f
     ):
         _progress(f"仍有 {sum(1 for r in results if not r.covered_elsewhere)} 条未消除的发现，"
                   f"按 --fail-on-findings 返回非零")
+        return 1
+
+    # audit/fix 里 results 已经是「基线之外、且没能证伪」的集合，
+    # 所以只要有结果就算新增问题
+    if getattr(args, "fail_on_new", False) and results:
+        _progress(f"存在 {len(results)} 条基线之外的新问题，按 --fail-on-new 返回非零")
         return 1
 
     return 0

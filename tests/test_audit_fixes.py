@@ -13,7 +13,7 @@ import shutil
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from bee.cli import main
@@ -460,6 +460,45 @@ class TestMergeFindingsKeepsDistinctRules(unittest.TestCase):
         merged = merge_findings([f1], [f2])
         ids = {f.rule_id for f in merged}
         self.assertEqual(ids, {"bee.hardcoded-credential", "semgrep.python.audit.key"})
+
+
+class TestBaselineAppliesToAudit(unittest.TestCase):
+    """--baseline 以前只对 scan 生效，audit/fix 接了参数却不理。
+
+    CI 里用 audit 做门禁时必须只处理新增问题，否则接上 LLM 后
+    会为几百条历史问题付费。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bee-audit-bl-"))
+        (self.tmp / "app.py").write_text(
+            'API_TOKEN = "prod_api_token_9f3c1a77"\n', encoding="utf-8"
+        )
+        self.bl = self.tmp / ".bee-baseline.json"
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_audit_skips_findings_in_baseline(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            main(["scan", str(self.tmp), "--detector", "rules",
+                  "--write-baseline", str(self.bl)])
+        self.assertTrue(self.bl.exists())
+
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+            code = main(["audit", str(self.tmp), "--detector", "rules",
+                         "--no-llm", "--baseline", str(self.bl)])
+        self.assertEqual(code, 0)
+        self.assertIn("未发现问题", buf.getvalue())
+
+    def test_audit_fail_on_new_after_baseline(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+            code = main(["audit", str(self.tmp), "--detector", "rules",
+                         "--no-llm", "--fail-on-new"])
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

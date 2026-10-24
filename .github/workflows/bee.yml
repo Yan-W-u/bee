@@ -77,14 +77,21 @@ jobs:
           BEE_LLM_API_KEY: ${{ secrets.BEE_LLM_API_KEY }}
         run: |
           # 有 API Key 时开启可解释性分析与补丁验证；没有则只做规则检测
-          # samples/benchmark/tests 是自带的漏洞样本与测试夹具，不是产品代码，排除掉
-          # 门禁固定用内置规则：结果可复现，不依赖 runner 上的 docker / 镜像版本。
-          # semgrep 作为本地增强保留，见 docs/ci.md。
-          EXCLUDE="--detector rules --exclude samples/** --exclude benchmark/cases/** --exclude tests/** --exclude examples/**"
+          # 用数组传参：拼成字符串再展开会让 bash 把 ** 当通配符，argparse 收到多余参数
+          ARGS=(--baseline .bee-baseline.json --sarif bee.sarif --detector rules
+                --exclude 'samples/**' --exclude 'benchmark/cases/**'
+                --exclude 'tests/**' --exclude 'examples/**')
+          set +e
           if [ -n "$BEE_LLM_API_KEY" ]; then
-            python -m bee audit . --baseline .bee-baseline.json --sarif bee.sarif $EXCLUDE
+            python -m bee audit . "${ARGS[@]}" 2>&1 | tee /tmp/bee-scan.log
           else
-            python -m bee scan . --baseline .bee-baseline.json --sarif bee.sarif --fail-on-new $EXCLUDE
+            python -m bee scan . --fail-on-new "${ARGS[@]}" 2>&1 | tee /tmp/bee-scan.log
+          fi
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            detail=$(tail -25 /tmp/bee-scan.log | tr '\n' '~' | head -c 1200)
+            echo "::error title=扫描失败(exit $rc)::${detail}"
+            exit "$rc"
           fi
 
       - name: 上传 SARIF 到 Code Scanning
