@@ -33,6 +33,6 @@ benchmark 数字偏乐观（自建样本）、大仓库无硬成本预算、只�
 
 ### 验收
 
-- 103 个单元测试全绿（`python -m unittest discover -s tests`）
+- 110 个单元测试全绿（`python -m unittest discover -s tests`）
 - 检测层 benchmark：16 正例 / 8 负例，TP 16 / FN 0 / FP 0（`--strict` 退出码 0）
-- GitHub Actions：push 触发单测 + benchmark + 扫描 + SARIF 上传
+- GitHub Actions：push 触发单测 + benchmark + 增量扫描 + SARIF 上传（Linux 实跑全绿）

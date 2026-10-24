@@ -157,9 +157,13 @@ python -m bee scan . --write-baseline .bee-baseline.json
 python -m bee scan . --baseline .bee-baseline.json --fail-on-new --sarif bee.sarif
 ```
 
-仓库自带 `.github/workflows/bee.yml`（PR 检查 + 上传 SARIF 到 Code Scanning）、
-`bee-full.yml`（额外跑 benchmark 与完整测试）、`.pre-commit-hooks.yaml`（提交前拦截）、
-`docs/ci.md`（GitLab / Jenkins / pre-commit 接入写法）。
+仓库自带 `.github/workflows/bee.yml`（push/PR 都跑：单元测试 + benchmark +
+增量扫描 + 上传 SARIF）、`bee-full.yml`（每周全量扫描，含 semgrep）、
+`.pre-commit-hooks.yaml`（提交前拦截）、`docs/ci.md`（GitLab / Jenkins / pre-commit 写法）。
+
+CI 门禁固定用 `--detector rules`：结果可复现，不依赖 runner 上的 docker 与镜像版本。
+仓库里提交了 `.bee-baseline.json`，所以第一次跑就是「只报新增」模式；
+semgrep 作为本地/周扫增强保留。
 
 ### 模型配置
 
@@ -457,7 +461,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # 检测层准确率回归
 ```
 
-105 个用例覆盖九块：
+110 个用例覆盖九块：
 
 - `tests/test_verify.py` —— 四项信号是否真的在拦截（含"能应用能编译但没修好"、
   "语法被改坏"、沙箱隔离三个关键用例）
