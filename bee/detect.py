@@ -484,6 +484,10 @@ SKIP_DIRS = {
     "site-packages", ".tox", "coverage", "htmlcov",
 }
 
+# bee 自己产出的文件不该被下一轮扫描：基线和 SARIF 里含被命中的代码片段，
+# 扫它们既制造噪音，也可能把敏感片段再报一遍。
+SKIP_FILENAMES = {".bee-baseline.json"}
+
 MAX_FILE_BYTES = 800_000
 
 _GLOB_CACHE: dict[str, re.Pattern] = {}
@@ -551,6 +555,8 @@ def iter_source_files(
         if not p.is_file():
             continue
         if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        if p.name in SKIP_FILENAMES or p.suffix.lower() == ".sarif":
             continue
         try:
             if p.stat().st_size > MAX_FILE_BYTES:

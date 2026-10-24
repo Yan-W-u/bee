@@ -59,7 +59,7 @@ jobs:
           if [ ! -f .bee-baseline.json ]; then
             echo "::notice::未找到基线文件，本次扫描全量写入 .bee-baseline.json。下载 artifact 并提交它之后，后续只报新增问题。"
             set +e
-            python -m bee scan . --write-baseline .bee-baseline.json --sarif bee.sarif \
+            python -m bee scan . --write-baseline .bee-baseline.json --sarif bee.sarif --detector rules \
               --exclude 'samples/**' --exclude 'benchmark/cases/**' --exclude 'tests/**' --exclude 'examples/**' \
               2>&1 | tee /tmp/bee-scan.log
             rc=${PIPESTATUS[0]}
@@ -78,7 +78,9 @@ jobs:
         run: |
           # 有 API Key 时开启可解释性分析与补丁验证；没有则只做规则检测
           # samples/benchmark/tests 是自带的漏洞样本与测试夹具，不是产品代码，排除掉
-          EXCLUDE="--exclude samples/** --exclude benchmark/cases/** --exclude tests/** --exclude examples/**"
+          # 门禁固定用内置规则：结果可复现，不依赖 runner 上的 docker / 镜像版本。
+          # semgrep 作为本地增强保留，见 docs/ci.md。
+          EXCLUDE="--detector rules --exclude samples/** --exclude benchmark/cases/** --exclude tests/** --exclude examples/**"
           if [ -n "$BEE_LLM_API_KEY" ]; then
             python -m bee audit . --baseline .bee-baseline.json --sarif bee.sarif $EXCLUDE
           else

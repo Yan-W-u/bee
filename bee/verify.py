@@ -36,6 +36,10 @@ def safe_join(root: Path, rel: str) -> Path:
     而且这在**验证阶段**就会发生，不需要 --apply。
     """
     rel = str(rel)
+    # Windows 形态的绝对路径在其他平台上也要拒绝：同一份补丁可能在不同 OS
+    # 上执行，路径语义不能随平台漂移（POSIX 上 C:\x 只是个怪文件名）。
+    if re.match(r"^[A-Za-z]:[\\/]", rel) or rel.startswith(("\\\\", "//")):
+        raise ValueError(f"拒绝绝对路径: {rel}")
     if Path(rel).is_absolute() or (len(rel) > 1 and rel[1] == ":"):
         raise ValueError(f"拒绝绝对路径: {rel}")
     root_resolved = root.resolve()
