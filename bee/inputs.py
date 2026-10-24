@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from .models import Finding, Severity
@@ -67,9 +68,12 @@ def findings_from_sarif(sarif_path: Path, root: Path) -> list[Finding]:
             uri = str(artifact.get("uri") or "").replace("\\", "/")
             if not uri:
                 continue
-            for prefix in ("file:///", "file://"):
-                if uri.startswith(prefix):
-                    uri = uri[len(prefix):]
+            if uri.startswith("file://"):
+                # 只去掉 "file://"，保留后面的 "/"——POSIX 上那是根，
+                # 去掉就变成相对路径了（Linux CI 上就是这么挂的）
+                uri = uri[len("file://"):]
+                if re.match(r"^/[A-Za-z]:", uri):   # Windows: /C:/x -> C:/x
+                    uri = uri[1:]
             rel = uri
             try:
                 candidate = Path(uri)

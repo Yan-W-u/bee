@@ -22,15 +22,28 @@ jobs:
 
       - name: 构建
         run: |
-          python -m pip install --upgrade build
-          python -m build
+          set +e
+          python -m pip install --upgrade build 2>&1 | tail -3
+          python -m build 2>&1 | tee /tmp/build.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            detail=$(tail -20 /tmp/build.log | tr '\n' '~' | head -c 1200)
+            echo "::error title=构建失败::${detail}"
+            exit "$rc"
+          fi
 
       - name: 在干净 venv 里验证安装
         run: |
+          set +e
           python -m venv /tmp/verify
-          /tmp/verify/bin/pip install --quiet dist/*.whl
+          /tmp/verify/bin/pip install --quiet dist/*.whl 2>&1 | tee /tmp/verify.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error title=wheel 安装失败::$(tail -15 /tmp/verify.log | tr '\n' '~' | head -c 1000)"
+            exit "$rc"
+          fi
           /tmp/verify/bin/bee --version
-          /tmp/verify/bin/bee scan . --detector rules --exclude 'tests/**' > /dev/null || true
+          /tmp/verify/bin/bee scan . --detector rules --exclude 'tests/**' > /dev/null
 
       - name: 挂到 Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65  # v2

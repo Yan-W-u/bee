@@ -11,6 +11,20 @@
 
 from __future__ import annotations
 
+
+def _force_utf8() -> None:
+    """Windows runner 的默认 stdout 编码不是 UTF-8，打印中文会 UnicodeEncodeError。
+
+    这个脚本的输出来自 CI（Windows 矩阵），所以必须在最前面就把编码钉死。
+    """
+    import sys as _sys
+    for stream in (_sys.stdout, _sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            continue
+
+
 import argparse
 import json
 import sys
@@ -146,6 +160,7 @@ def render(metrics: dict, as_markdown: bool) -> str:
 
 
 def main() -> int:
+    _force_utf8()
     parser = argparse.ArgumentParser(description="bee benchmark")
     parser.add_argument("--markdown", action="store_true", help="输出 markdown 表格")
     parser.add_argument("--strict", action="store_true", help="有 FN/FP 时返回非零")

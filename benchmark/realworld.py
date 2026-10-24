@@ -15,6 +15,20 @@ benchmark/cases 里的 24 个样本是照着规则能力写的，只能证明「
 
 from __future__ import annotations
 
+
+def _force_utf8() -> None:
+    """Windows runner 的默认 stdout 编码不是 UTF-8，打印中文会 UnicodeEncodeError。
+
+    这个脚本的输出来自 CI（Windows 矩阵），所以必须在最前面就把编码钉死。
+    """
+    import sys as _sys
+    for stream in (_sys.stdout, _sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            continue
+
+
 import argparse
 import json
 import os
@@ -176,6 +190,7 @@ def write_sample(results: list[dict], count: int, out: Path) -> None:
 
 
 def main() -> int:
+    _force_utf8()
     ap = argparse.ArgumentParser(description="真实语料评测")
     ap.add_argument("--check", action="store_true", help="按 expected.json 阈值判定")
     ap.add_argument("--sample", type=int, default=0, help="额外输出 N 条分层抽样")
