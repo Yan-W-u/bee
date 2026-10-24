@@ -5,12 +5,13 @@
 零第三方依赖，纯标准库，Windows / macOS / Linux 都能直接跑。
 
 ```bash
-pipx install bee-scanner      # 或 pip install bee-scanner
+# 从 Release 安装（PyPI 尚未发布，见「已知限制」）
+pipx install https://github.com/Yan-W-u/bee/releases/download/v1.1.0/bee_scanner-1.1.0-py3-none-any.whl
 bee --version                 # bee 1.1.0
 bee scan ./your-project       # 先看有什么，纯静态、只读
 ```
 
-不想装也能用：`git clone` 之后 `python -m bee scan ./your-project`。
+也可以不装：`git clone` 之后 `python -m bee scan ./your-project`（零依赖，直接跑源码）。
 
 > **关于本仓库的来源**：早期版本基于 [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi)
 > （MIT）修改，未实现其声称的能力，已被完全替换。当前版本是从零重写的独立实现，
@@ -454,7 +455,10 @@ python benchmark/realworld.py --sample 12      # 生成人工标注表
     重扫会得到假的「已修复」，所以 `finding_gone` 记为 `None`，这类补丁永远不会
     显示「已验证」。要完整验证就补一条等价的自定义规则（见
     [docs/semgrep-integration.md](docs/semgrep-integration.md)）。
-12. **大仓库的成本有上限但没有硬预算。** 调用方搜索最多扫 2000 个文件、单条
+12. **还没发布到 PyPI。** 发行名 `bee-scanner` 已确定（`bee` 被 2012 年的包占用），
+    但上传需要维护者在本机 `twine upload`。当前只能从 [Releases](../../releases)
+    下载 wheel 安装。
+13. **大仓库的成本有上限但没有硬预算。** 调用方搜索最多扫 2000 个文件、单条
     finding 的上下文有字符预算，但每条补丁仍要复制一次完整项目、`--run-tests`
     时还要跑一遍全量测试。几十万行的仓库建议先 `--limit` / `--min-severity`。
 
