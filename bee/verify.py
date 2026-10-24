@@ -504,6 +504,7 @@ def verify_patch(
     run_tests: bool = True,
     base_texts: dict[str, str] | None = None,
     rules: list[Rule] | None = None,
+    rescan: bool = True,
 ) -> PatchAttempt:
     involved = proposal.files() or [finding.path]
 
@@ -562,25 +563,34 @@ def verify_patch(
     #   和 src/b/models.py 互相覆盖，跨文件补丁的结论就不可信。
     # - 必须传同一个 rules 集合。用默认内置规则重扫自定义规则的 finding，
     #   结果永远是空 → finding_gone 恒真 → 空补丁也能被判「已验证修复」。
-    tmp_scan_dir = Path(tempfile.mkdtemp(prefix="bee-scan-"))
-    try:
-        for rel in involved:
-            probe = tmp_scan_dir / rel
-            probe.parent.mkdir(parents=True, exist_ok=True)
-            write_source(probe, patched[rel])
-        remaining: list[Finding] = []
-        for rel in involved:
-            probe = tmp_scan_dir / rel
-            remaining.extend(
-                f for f in scan_file(probe, tmp_scan_dir, rules) if f.rule_id == finding.rule_id
-            )
-        attempt.finding_gone = len(remaining) == 0
-        if not attempt.finding_gone:
-            attempt.errors.append(
-                f"重新扫描仍命中 {finding.rule_id}（{len(remaining)} 处）"
-            )
-    finally:
-        shutil.rmtree(tmp_scan_dir, ignore_errors=True)
+    if not rescan:
+        # 外部 SARIF 的 finding 没有对应的本地规则。用内置规则重扫只会得到
+        # 「空结果 = 已修复」这种假阳性结论，比不验证更危险，所以记为 None。
+        attempt.finding_gone = None
+        attempt.notes.append(
+            "finding 来自外部 SARIF，本地没有可重扫的同名规则，未做「漏洞消失」验证"
+        )
+    else:
+        tmp_scan_dir = Path(tempfile.mkdtemp(prefix="bee-scan-"))
+        try:
+            for rel in involved:
+                probe = tmp_scan_dir / rel
+                probe.parent.mkdir(parents=True, exist_ok=True)
+                write_source(probe, patched[rel])
+            remaining: list[Finding] = []
+            for rel in involved:
+                probe = tmp_scan_dir / rel
+                remaining.extend(
+                    f for f in scan_file(probe, tmp_scan_dir, rules)
+                    if f.rule_id == finding.rule_id
+                )
+            attempt.finding_gone = len(remaining) == 0
+            if not attempt.finding_gone:
+                attempt.errors.append(
+                    f"重新扫描仍命中 {finding.rule_id}（{len(remaining)} 处）"
+                )
+        finally:
+            shutil.rmtree(tmp_scan_dir, ignore_errors=True)
 
     # --- 4. 落到临时副本上做编译与测试
     workdir: Path | None = None

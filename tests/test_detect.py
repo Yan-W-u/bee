@@ -137,5 +137,114 @@ class TestSuppression(unittest.TestCase):
         self.assertNotIn("bee.hardcoded-credential", hits)
 
 
+class TestNoiseReduction(unittest.TestCase):
+    """真实语料上的误报结构回归。
+
+    stdlib 扫描从 321 条降到 81 条，靠的就是这几类抑制。
+    每一条都必须有测试，否则下次改规则会把噪音放回来。
+    """
+
+    def test_js_function_keyword_not_matched_in_python(self):
+        # iscoroutinefunction( / this_function( 曾因 `Function` 无左边界全部命中
+        hits = scan_snippet("a.py", "x = iscoroutinefunction(cb)\n")
+        self.assertNotIn("bee.code-injection", hits)
+        hits = scan_snippet("a.py", "y = this_function(1)\n")
+        self.assertNotIn("bee.code-injection", hits)
+
+    def test_function_constructor_not_matched_in_python(self):
+        hits = scan_snippet("a.py", "Function(x)\n")
+        self.assertNotIn("bee.code-injection", hits)
+
+    def test_function_constructor_still_matched_in_js(self):
+        hits = scan_snippet("a.js", "Function(userInput)()\n")
+        self.assertIn("bee.code-injection", hits)
+
+    def test_eval_in_docstring_not_matched(self):
+        hits = scan_snippet("a.py", '"""use eval() carefully"""\n')
+        self.assertNotIn("bee.code-injection", hits)
+
+    def test_eval_in_comment_not_matched(self):
+        hits = scan_snippet("a.py", "# call eval(x) here\ndef f():\n    return 1\n")
+        self.assertNotIn("bee.code-injection", hits)
+
+    def test_real_eval_still_matched(self):
+        hits = scan_snippet("a.py", "def f(src):\n    return eval(src)\n")
+        self.assertIn("bee.code-injection", hits)
+
+    def test_credential_meta_name_not_matched(self):
+        # token_type / api_key_name 这类是名字里的关键词，不是凭据
+        hits = scan_snippet("a.py", "token_type = 'unstructured'\n")
+        self.assertNotIn("bee.hardcoded-credential", hits)
+        hits = scan_snippet("a.py", "api_key_name = 'X-Api-Key'\n")
+        self.assertNotIn("bee.hardcoded-credential", hits)
+
+    def test_short_or_placeholder_value_not_matched(self):
+        hits = scan_snippet("a.py", 'password = "changeme"\n')
+        self.assertNotIn("bee.hardcoded-credential", hits)
+        hits = scan_snippet("a.py", 'password = "YOUR_TOKEN_HERE"\n')
+        self.assertNotIn("bee.hardcoded-credential", hits)
+
+    def test_real_hardcoded_secret_still_matched(self):
+        hits = scan_snippet("a.py", 'api_key = "sk_live_9f8a7b6c5d4e3f2a"\n')
+        self.assertIn("bee.hardcoded-credential", hits)
+
+    def test_timing_token_compare_not_matched(self):
+        hits = scan_snippet("a.py", "if tokenL == 0xF:\n    pass\n")
+        self.assertNotIn("bee.timing-attack", hits)
+
+    def test_timing_real_secret_compare_still_matched(self):
+        hits = scan_snippet("a.py", "if expected_signature == provided_signature:\n    pass\n")
+        self.assertIn("bee.timing-attack", hits)
+
+    def test_self_join_base_not_reported(self):
+        # open(os.path.join(self._path, key)) 是对象内部目录，不是外部可控根
+        hits = scan_snippet("a.py",
+                            "class M:\n"
+                            "    def get(self, key):\n"
+                            "        return open(os.path.join(self._path, key), 'rb')\n")
+        self.assertNotIn("bee.path-traversal", hits)
+
+    def test_module_join_base_still_reported(self):
+        hits = scan_snippet("a.py",
+                            "def read(name):\n"
+                            "    return open(os.path.join('/var/data', name), 'rb')\n")
+        self.assertIn("bee.path-traversal", hits)
+
+    def test_extractall_with_filter_not_reported(self):
+        hits = scan_snippet("a.py",
+                            "def unpack(zf, dest):\n"
+                            "    zf.extractall(dest, filter='data')\n")
+        self.assertNotIn("bee.zip-slip", hits)
+
+    def test_plain_extractall_still_reported(self):
+        hits = scan_snippet("a.py",
+                            "def unpack(zf, dest):\n"
+                            "    zf.extractall(dest)\n")
+        self.assertIn("bee.zip-slip", hits)
+
+
+class TestProfiles(unittest.TestCase):
+    def test_every_rule_has_confidence(self):
+        from bee.detect import BUILTIN_RULES, Confidence
+        for rule in BUILTIN_RULES:
+            self.assertIsInstance(rule.confidence, Confidence, f"{rule.id} 未登记 confidence")
+
+    def test_profile_filtering(self):
+        from bee.cli import _select_rules
+        strict = {r.id for r in _select_rules(None, None, "strict")}
+        default = {r.id for r in _select_rules(None, None, "default")}
+        full = {r.id for r in _select_rules(None, None, "full")}
+        self.assertLess(len(strict), len(default))
+        self.assertLess(len(default), len(full))
+        self.assertIn("bee.sql-injection", strict)
+        self.assertNotIn("bee.timing-attack", strict)
+        self.assertIn("bee.timing-attack", full)
+
+    def test_explicit_rule_ignores_profile(self):
+        from bee.cli import _select_rules
+        rules = _select_rules(["bee.timing-attack"], None, "strict")
+        self.assertEqual([r.id for r in rules], ["bee.timing-attack"])
+
+
 if __name__ == "__main__":
     unittest.main()

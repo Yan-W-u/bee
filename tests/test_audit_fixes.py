@@ -501,5 +501,34 @@ class TestBaselineAppliesToAudit(unittest.TestCase):
         self.assertEqual(code, 1)
 
 
+class TestBudget(unittest.TestCase):
+    """预算把「跑一晚上 + 账单失控」变成可预测。"""
+
+    def test_stops_at_max_findings(self):
+        from bee.budget import Budget
+
+        b = Budget(max_findings=2, max_llm_calls=0, max_seconds=0)
+        self.assertTrue(b.allows_more(5))
+        b.charge(5)
+        self.assertTrue(b.allows_more(5))
+        b.charge(5)
+        self.assertFalse(b.allows_more(5))
+        self.assertIn("max-findings", b.summary())
+
+    def test_stops_before_exceeding_calls(self):
+        from bee.budget import Budget
+
+        b = Budget(max_findings=0, max_llm_calls=10, max_seconds=0)
+        b.charge(5)
+        self.assertFalse(b.allows_more(6), "5+6 > 10，必须提前拒绝")
+        self.assertTrue(b.allows_more(5))
+
+    def test_skipped_reason_marks_result(self):
+        from bee.models import RepairResult
+
+        r = RepairResult(finding=make_finding(), skipped_reason="已达 --max-findings=20")
+        self.assertEqual(r.status, "skipped")
+
+
 if __name__ == "__main__":
     unittest.main()

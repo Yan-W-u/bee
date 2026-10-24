@@ -1,0 +1,54 @@
+name: Bug 报告
+description: 行为不符合预期（不是规则误报/漏报——那请用「规则问题」模板）
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先确认版本：`bee --version`。如果是**安全问题**（路径穿越、命令执行、
+        凭据泄露），请不要开公开 issue，见 [SECURITY.md](../SECURITY.md)。
+  - type: input
+    id: version
+    attributes:
+      label: bee 版本
+      placeholder: bee 1.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 操作系统
+      options:
+        - Windows
+        - Linux
+        - macOS
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: 出问题的子命令
+      options: [scan, audit, fix, 其它]
+    validations:
+      required: true
+  - type: textarea
+    id: command_line
+    attributes:
+      label: 完整命令
+      render: shell
+      placeholder: bee fix ./repo --limit 3 --no-tests
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为（贴报错栈，不要只贴截图）
+      render: shell
+    validations:
+      required: true

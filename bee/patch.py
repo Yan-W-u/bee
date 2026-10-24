@@ -286,6 +286,7 @@ def repair_finding(
     run_tests: bool = True,
     session: PatchSession | None = None,
     rules: list | None = None,
+    rescan: bool = True,
 ) -> list[PatchAttempt]:
     """多轮修复，直到验证通过或用尽轮次。
 
@@ -322,6 +323,7 @@ def repair_finding(
         attempt = verify_patch(
             finding, proposal, root, round_no,
             run_tests=run_tests, base_texts=base_texts, rules=rules,
+            rescan=rescan,
         )
         attempt.explanation = proposal.rationale
         attempts.append(attempt)

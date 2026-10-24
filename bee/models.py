@@ -133,7 +133,8 @@ class PatchAttempt:
     new_string: str = ""
     edits: list[tuple[str, str, str]] = field(default_factory=list)
     applied: bool = False
-    finding_gone: bool = False
+    # None = 无法重扫（例如 finding 来自外部 SARIF，规则不在 bee 内）
+    finding_gone: bool | None = False
     compiles: bool = False
     compile_checked: bool = False  # False 表示该环境没有对应语言的语法检查器
     tests_pass: bool | None = None  # None 表示没有测试可跑，不算失败也不算通过
@@ -144,7 +145,7 @@ class PatchAttempt:
     def succeeded(self) -> bool:
         return (
             self.applied
-            and self.finding_gone
+            and self.finding_gone is True
             and self.compiles
             and (self.tests_pass is not False)
         )
@@ -155,7 +156,9 @@ class PatchAttempt:
         parts: list[str] = []
         if not self.applied:
             parts.append("补丁无法应用（上下文不匹配）")
-        if not self.finding_gone:
+        if self.finding_gone is None:
+            parts.append("未做重扫（外部规则不在 bee 内）")
+        elif not self.finding_gone:
             parts.append("重新扫描后漏洞仍然存在")
         if not self.compiles:
             parts.append("修改后代码无法通过编译/语法检查")
@@ -174,6 +177,8 @@ class RepairResult:
     accepted: PatchAttempt | None = None
     # 前一条补丁已顺带修掉该处，不是失败也不是未修
     covered_elsewhere: bool = False
+    # 预算用尽等原因未处理（不是「没问题」）
+    skipped_reason: str = ""
 
     @property
     def status(self) -> str:
@@ -181,6 +186,8 @@ class RepairResult:
             return "verified"
         if self.covered_elsewhere:
             return "covered"
+        if self.skipped_reason:
+            return "skipped"
         if self.attempts:
             return "unverified"
         return "explained"

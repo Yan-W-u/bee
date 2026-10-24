@@ -59,6 +59,8 @@ def _status_line(result: RepairResult) -> str:
         else:
             bits.append("无测试可跑")
         return f"✅ **已验证修复**（第 {a.round} 轮）— " + " · ".join(bits)
+    if result.status == "skipped":
+        return f"⏸ **未处理** — {result.skipped_reason}"
     if result.status == "covered":
         return "⊘ **已被前述补丁覆盖** — 该处在之前的修复中一并消除，无需单独改"
     if result.status == "unverified":

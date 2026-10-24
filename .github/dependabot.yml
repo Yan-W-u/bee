@@ -1,0 +1,15 @@
+version: 2
+updates:
+  # workflow 里所有 uses: 都固定到了 commit SHA，靠 Dependabot 定期提 PR 更新
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "ci"
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    commit-message:
+      prefix: "deps"

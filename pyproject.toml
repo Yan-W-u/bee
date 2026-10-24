@@ -1,11 +1,29 @@
 [project]
-name = "bee"
-version = "1.0.0"
+# PyPI 上 `bee` 已被 2012 年的包占用，发行名用 bee-scanner；
+# 命令行仍然是 `bee`，import 包名也仍然是 bee。
+name = "bee-scanner"
+version = "1.1.0"
 description = "漏洞检测 + 可解释性修复 + 机器验证补丁"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE", "NOTICE"]
 dependencies = []
+keywords = ["security", "sast", "llm", "vulnerability", "sarif", "appsec"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Security",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/Yan-W-u/bee"
+Repository = "https://github.com/Yan-W-u/bee"
+Issues = "https://github.com/Yan-W-u/bee/issues"
+Changelog = "https://github.com/Yan-W-u/bee/blob/main/CHANGELOG.md"
 
 [project.scripts]
 bee = "bee.cli:main"

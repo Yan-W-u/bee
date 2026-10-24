@@ -13,16 +13,24 @@ permissions:
 
 jobs:
   self-check:
-    name: 单元测试 + 规则 benchmark
-    runs-on: ubuntu-latest
+    name: 自检 (${{ matrix.os }} / py${{ matrix.python }})
+    # Windows 必须在矩阵里：作者主力平台是 Windows，已出过 CRLF、符号链接、
+    # npm.cmd 三个平台专属 bug，只在 Linux 上跑等于不设防。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.10", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python }}
 
       - name: 单元测试
+        shell: bash
         env:
           PYTHONIOENCODING: utf-8
         run: |
@@ -40,17 +48,22 @@ jobs:
       - name: 规则 benchmark（有 FN/FP 则失败）
         run: python benchmark/run.py --strict
 
+      # 误报回涨的早期预警：先只告警不阻断，稳定后再改成硬门禁
+      - name: 真实语料噪音（告警）
+        continue-on-error: true
+        run: python benchmark/realworld.py --check
+
   scan:
     name: 漏洞扫描
     runs-on: ubuntu-latest
     env:
       PYTHONIOENCODING: utf-8
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7
         with:
           python-version: "3.12"
 
@@ -96,14 +109,14 @@ jobs:
 
       - name: 上传 SARIF 到 Code Scanning
         if: always()
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370  # v4
         with:
           sarif_file: bee.sarif
           category: bee
 
       - name: 保留报告与基线
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: bee-sarif
           path: |

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from . import __version__, baseline, sarif
 from .detect import (
-    BUILTIN_RULES, iter_source_files, load_custom_rules, matches_globs,
+    BUILTIN_RULES, Confidence, iter_source_files, load_custom_rules, matches_globs,
     merge_findings, scan_tree,
 )
 from .explain import explain
@@ -50,13 +50,23 @@ def _progress(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
-def _select_rules(ids: list[str] | None, custom: Path | None) -> list:
+_CONF_ORDER = {Confidence.LOW: 0, Confidence.MEDIUM: 1, Confidence.HIGH: 2}
+_PROFILE_FLOOR = {"strict": Confidence.HIGH, "default": Confidence.MEDIUM, "full": Confidence.LOW}
+
+
+def _select_rules(
+    ids: list[str] | None, custom: Path | None, profile: str = "default"
+) -> list:
     rules = list(BUILTIN_RULES)
     if custom:
         rules = load_custom_rules(custom)
     if ids:
         wanted = {i.strip() for i in ids if i.strip()}
         rules = [r for r in rules if r.id in wanted or r.id.split(".")[-1] in wanted]
+    floor = _PROFILE_FLOOR.get(profile, Confidence.MEDIUM)
+    # 显式 --rule 指定的规则不受档位限制：用户点名要的就得报
+    if not ids:
+        rules = [r for r in rules if _CONF_ORDER[getattr(r, "confidence", Confidence.MEDIUM)] >= _CONF_ORDER[floor]]
     return rules
 
 
@@ -65,6 +75,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="bee",
         description="漏洞检测 + 可解释性修复 + 机器验证",
     )
+    p.add_argument("--version", action="version", version=f"bee {__version__}")
     sub = p.add_subparsers(dest="command")
 
     def common(sp: argparse.ArgumentParser) -> None:
@@ -72,6 +83,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--output", "-o", help="报告输出路径（.md）")
         sp.add_argument("--json", action="store_true", help="以 JSON 输出结果")
         sp.add_argument("--min-severity", choices=["info", "warning", "error"], default="info")
+        sp.add_argument("--profile", choices=["strict", "default", "full"], default="default",
+                        help="规则档位：strict 只报高把握规则，default 含需上下文的，full 全量启发式")
         sp.add_argument("--rule", action="append", help="只跑指定规则（可多次）")
         sp.add_argument("--rules-file", type=Path, help="自定义规则文件（Python，定义 RULES 列表）")
         sp.add_argument("--include", action="append", help="只扫描匹配的 glob，如 'src/**/*.py'")
@@ -81,10 +94,18 @@ def build_parser() -> argparse.ArgumentParser:
                         help="检测后端：rules=内置规则，semgrep=外部引擎，both=合并，auto=有 semgrep 就合并")
         sp.add_argument("--semgrep-config", default="auto",
                         help="semgrep 规则集，默认 auto（registry），也可传本地规则目录")
+        sp.add_argument("--input", type=Path,
+                        help="从 SARIF 2.1.0 读取 finding，跳过内置检测，直接进入解释/修复")
         sp.add_argument("--baseline", type=Path, help="只报告相对该基线新增的问题")
         sp.add_argument("--write-baseline", type=Path, help="把当前结果写成基线文件")
         sp.add_argument("--fail-on-new", action="store_true",
                         help="存在基线之外的新问题时以退出码 1 结束（供 CI 使用）")
+        sp.add_argument("--max-findings", type=int, default=20,
+                        help="最多处理多少条发现（0=不限，默认 20）")
+        sp.add_argument("--max-llm-calls", type=int, default=120,
+                        help="模型调用次数上限估算（0=不限，默认 120）")
+        sp.add_argument("--max-seconds", type=int, default=1800,
+                        help="墙钟时间上限（0=不限，默认 1800）")
         sp.add_argument("--fail-on-findings", action="store_true",
                         help="只要还有未修复/未入基线的发现就以退出码 1 结束（CI 门禁）")
         sp.add_argument("--sarif", type=Path, help="额外输出 SARIF 2.1.0 供 GitHub Code Scanning 使用")
@@ -116,6 +137,20 @@ def _collect_targets(target: Path, include: list[str] | None, exclude: list[str]
     if target.is_file():
         return [target]
     return iter_source_files(target, include, exclude or None)
+
+
+def _warn_if_empty(target: Path, files: list[Path]) -> None:
+    """扫到 0 个文件时必须说出来。
+
+    目标落在 site-packages / node_modules 这类被跳过的目录下时，
+    以前的表现是「扫描 0 个文件，无新增问题」——比误报更糟，
+    因为使用者会以为项目是干净的。
+    """
+    if target.is_dir() and not files:
+        _progress(
+            "警告：扫描到 0 个文件。若目标位于 site-packages / node_modules / vendor 等目录，"
+            "请用 --include 指定文件，或把目标复制到普通目录后再扫。"
+        )
 
 
 def _filter_findings(
@@ -164,10 +199,23 @@ def _detect_all(
     include/exclude/单文件目标对所有后端生效：内置规则在遍历时剪枝，
     semgrep 结果在事后按同样语义过滤。
     """
-    mode = getattr(args, "detector", "auto")
-    config = getattr(args, "semgrep_config", "auto") or "auto"
     include = getattr(args, "include", None)
     exclude = getattr(args, "exclude", []) or []
+    input_path = getattr(args, "input", None)
+    if input_path:
+        from .inputs import findings_from_sarif
+
+        try:
+            found = findings_from_sarif(input_path, root)
+        except (OSError, ValueError) as exc:
+            _progress(f"读取 SARIF 失败: {exc}")
+            return [], []
+        return _filter_findings(found, include, exclude, only_paths), [
+            f"外部 SARIF：{input_path.name}（{len(found)} 条，未做本地重扫）"
+        ]
+
+    mode = getattr(args, "detector", "auto")
+    config = getattr(args, "semgrep_config", "auto") or "auto"
     notes: list[str] = []
 
     if mode == "semgrep":
@@ -207,9 +255,10 @@ def cmd_scan(args: argparse.Namespace) -> int:
         _progress(f"路径不存在: {target}")
         return 2
 
-    rules = _select_rules(args.rule, args.rules_file)
+    rules = _select_rules(args.rule, args.rules_file, getattr(args, "profile", "default"))
     root = target if target.is_dir() else target.parent
     files = _collect_targets(target, args.include, args.exclude)
+    _warn_if_empty(target, files)
     only_paths = None if target.is_dir() else {target.name}
 
     findings, notes = _detect_all(root, rules, args, only_paths=only_paths)
@@ -302,10 +351,11 @@ def _make_results(
     target: Path,
     do_fix: bool,
 ) -> tuple[list[RepairResult], int]:
-    rules = _select_rules(args.rule, args.rules_file)
+    rules = _select_rules(args.rule, args.rules_file, getattr(args, "profile", "default"))
     root = target if target.is_dir() else target.parent
 
     files = _collect_targets(target, args.include, args.exclude)
+    _warn_if_empty(target, files)
     only_paths = None if target.is_dir() else {target.name}
     findings, notes = _detect_all(root, rules, args, only_paths=only_paths)
     for note in notes:
@@ -356,7 +406,17 @@ def _make_results(
     if do_fix and not run_tests:
         _progress("回归测试默认关闭（--run-tests 开启）。验证到「重扫 + 语法」层。")
 
+    from .budget import Budget
     from .context import build_context
+
+    rounds = getattr(args, "rounds", 3)
+    # 每条 finding 最多消耗：解释 2 轮 + 补丁 rounds 轮
+    per_finding_calls = 2 + rounds
+    budget = Budget(
+        max_findings=getattr(args, "max_findings", 0) or 0,
+        max_llm_calls=getattr(args, "max_llm_calls", 0) or 0,
+        max_seconds=getattr(args, "max_seconds", 0) or 0,
+    )
 
     # 同一文件多处漏洞要累积修复，否则后一条补丁的上下文会被前一条改掉
     session = PatchSession(root)
@@ -364,9 +424,14 @@ def _make_results(
     results: list[RepairResult] = []
     total = len(findings)
     for i, f in enumerate(findings, 1):
+        if client is not None and client.config.usable and not budget.allows_more(per_finding_calls):
+            results.append(RepairResult(finding=f, skipped_reason=budget.stopped_reason))
+            continue
         _progress(f"[{i}/{total}] {f.location}  {f.message}")
         ctx = build_context(f, root)
         expl = explain(f, ctx, client, root)
+        if client is not None and client.config.usable:
+            budget.charge(per_finding_calls)
         result = RepairResult(finding=f, explanation=expl)
 
         if do_fix and client is not None and client.config.usable:
@@ -391,6 +456,7 @@ def _make_results(
                 run_tests=run_tests,
                 session=session,
                 rules=rules,
+                rescan=not bool(getattr(args, "input", None)),
             )
             result.attempts = attempts
             result.accepted = next((a for a in attempts if a.succeeded), None)
@@ -400,7 +466,19 @@ def _make_results(
                 _progress(f"       ⚠️ {attempts[-1].failure_reason()}")
         results.append(result)
 
+    if budget.stopped_reason:
+        _progress(budget.summary())
+
     setattr(args, "_session", session)
+    setattr(args, "_budget", budget)
+    if client is not None and client.config.usable:
+        from .llm import PROMPT_VERSION
+
+        setattr(args, "_llm_meta", {
+            "model": client.config.model,
+            "temperature": client.config.temperature,
+            "prompt_version": PROMPT_VERSION,
+        })
     return results, len(files)
 
 
@@ -419,7 +497,9 @@ def _emit(args: argparse.Namespace, results: list[RepairResult], target: Path, f
                 },
                 "explanation": r.explanation.__dict__ if r.explanation else None,
                 "status": r.status,
+                "skipped_reason": r.skipped_reason,
                 "attempts": [a.__dict__ for a in r.attempts],
+                "meta": getattr(args, "_llm_meta", None),
             })
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
     else:

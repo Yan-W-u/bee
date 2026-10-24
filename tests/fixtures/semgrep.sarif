@@ -1,0 +1,51 @@
+{
+  "$schema": "https://docs.oasis-open.org/sarif/sarif/v2.1.0/cs01/schemas/sarif-schema-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "semgrep",
+          "rules": [
+            {
+              "id": "python.lang.security.audit.formatted-sql-query",
+              "defaultConfiguration": {"level": "error"}
+            },
+            {
+              "id": "python.lang.security.audit.insecure-file-permissions",
+              "defaultConfiguration": {"level": "warning"}
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "python.lang.security.audit.formatted-sql-query",
+          "level": "error",
+          "message": {"text": "Detected possible formatted SQL query."},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "app/db.py"},
+                "region": {"startLine": 12, "endLine": 13}
+              }
+            }
+          ],
+          "properties": {"cwe": ["CWE-89"]}
+        },
+        {
+          "ruleId": "python.lang.security.audit.insecure-file-permissions",
+          "message": {"text": "File created with overly broad permissions."},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "app/files.py"},
+                "region": {"startLine": 7}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

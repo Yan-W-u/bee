@@ -1,0 +1,39 @@
+{
+  "_doc": "真实代码语料。路径支持 $VAR / ${VAR}，内置变量由 sysconfig / sys.executable 解析，CI 上无需额外准备。",
+  "corpora": [
+    {
+      "name": "python-stdlib",
+      "path": "${PY_STDLIB}",
+      "note": "CPython 标准库：大型成熟代码，误报噪音的主战场",
+      "exclude": [
+        "test/**",
+        "**/test/**",
+        "tests/**",
+        "**/tests/**",
+        "idlelib/**",
+        "site-packages/**",
+        "lib2to3/**",
+        "tkinter/**",
+        "**/__pycache__/**"
+      ]
+    },
+    {
+      "name": "site-packages",
+      "path": "${PY_SITE_PACKAGES}",
+      "note": "本机已安装的第三方包：中型真实项目（环境不同结果会有差异，阈值放很宽）",
+      "exclude": ["**/tests/**", "**/test/**"]
+    },
+    {
+      "name": "self",
+      "path": "${BEE_REPO}",
+      "note": "bee 自扫：必须保持 0 新增，否则说明自己的规则打自己",
+      "exclude": [
+        "samples/**",
+        "benchmark/cases/**",
+        "tests/**",
+        "examples/**",
+        ".git/**"
+      ]
+    }
+  ]
+}

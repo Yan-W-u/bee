@@ -10,14 +10,29 @@
 
 from __future__ import annotations
 
+import io
 import re
+import tokenize
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from .io_utils import read_source
 from .models import Finding, Severity
 
 # ---------------------------------------------------------------- 规则定义
+
+
+class Confidence(str, Enum):
+    """规则的判定把握度，决定它出现在哪个 --profile 档位。
+
+    真实项目里误报的代价不是「多看一眼」，而是使用者直接关掉这条流水线。
+    分档让「模式明确」和「启发式」分开：默认档只报有把握的。
+    """
+
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
 
 
 @dataclass
@@ -36,6 +51,14 @@ class Rule:
     root_cause_hint: str = ""
     fix_hint: str = ""
     references: list[str] = field(default_factory=list)
+    confidence: Confidence = Confidence.MEDIUM
+    # 命中本来就该落在字符串字面量内部（PEM 私钥、云厂商密钥），
+    # 这类规则不能被字符串过滤掉
+    allow_in_strings: bool = False
+    # 按语言覆盖 pattern：同一条规则在 Python 和 JS 里的危险写法完全不同，
+    # 用一个正则硬套必然两个方向都错（Python 的 iscoroutinefunction 被 JS 的
+    # Function( 分支命中，就是这个坑）
+    pattern_by_lang: dict[str, str] = field(default_factory=dict)
 
 
 def _r(*rules: Rule) -> list[Rule]:
@@ -84,7 +107,9 @@ BUILTIN_RULES: list[Rule] = _r(
         owasp=["A01:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php"],
         # 两条分支：join 系列，以及「绝对路径字面量 + 变量」的直接拼接
-        pattern=r"""(?is)(?:(?:open|readFile|readFileSync|createReadStream|send_file|sendFile|ioutil\.ReadFile|os\.ReadFile|FileInputStream)\s*\(\s*(?:os\.path\.join|path\.join|filepath\.Join)\s*\([^)]{0,200}\w[^)]{0,200}\)?|(?:open|readFile|readFileSync)\s*\(\s*f?["'][^"'\n]{0,160}/["']\s*\+)""",
+        # join 的第一个参数是 self.xxx 时跳过：那是对象内部目录（mailbox、
+        # 缓存实现这类），不是外部可控根目录，这类是 stdlib 上 10 条误报的来源。
+        pattern=r"""(?is)(?:(?:open|readFile|readFileSync|createReadStream|send_file|sendFile|ioutil\.ReadFile|os\.ReadFile|FileInputStream)\s*\(\s*(?:os\.path\.join|path\.join|filepath\.Join)\s*\(\s*(?!self\.)[^)]{0,200}\w[^)]{0,200}\)?|(?:open|readFile|readFileSync)\s*\(\s*f?["'][^"'\n]{0,160}/["']\s*\+)""",
         safe_when=[
             r"(?i)secure_filename|\bbasename\b|\brealpath\b|\bResolve\b.*\bHasPrefix\b|\bcommonpath\b|\bfromfilepath\b",
         ],
@@ -102,7 +127,9 @@ BUILTIN_RULES: list[Rule] = _r(
         languages=["python", "javascript", "typescript", "go", "java", "php", "yaml", "json", "env"],
         # 用零宽后视而不是 [^A-Za-z0-9]：后者会吞掉换行符，导致行号整体偏移 1。
         # 分隔符要同时支持 = 和 :，否则 YAML / JSON 配置里的 password: "xxx" 会漏掉。
-        pattern=r"""(?i)(?<![A-Za-z0-9])(?:[A-Za-z0-9_.]*)(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_]*\s*(?<![=!<>])[:=](?!=)\s*["'][^"'\s]{6,}["']""",
+        # 命名捕获组 (1)=变量名 (2)=引号 (3)=值：光靠正则判断不了「这是不是真凭据」，
+        # 必须看值本身（token_type = 'unstructured' 那种必须排除）。
+        pattern=r"""(?i)(?<![A-Za-z0-9])([A-Za-z0-9_.]*(?:password|passwd|pwd|secret|api[_-]?key|access[_-]?key|private[_-]?key|token|credential)[A-Za-z0-9_]*)\s*(?<![=!<>])[:=](?!=)\s*(["'])([^"'\s]{6,})\2""",
         safe_when=[
             r"(?i)(?:os\.getenv|os\.environ|process\.env|getenv\(|env::var|\$\{|<[a-z_-]+>|xxx+|YOUR_|PLACEHOLDER|CHANGE_?ME|example|dummy|test|sample|your-|\*\*\*)",
         ],
@@ -132,7 +159,15 @@ BUILTIN_RULES: list[Rule] = _r(
         languages=["python", "javascript", "typescript", "php"],
         # 裸 eval(变量) 本身就是高危，不该要求它必须伴随字符串拼接。
         # 只排除 literal_eval 与无参的 model.eval()。
-        pattern=r"""(?is)\b(?:eval|exec|execfile)\s*\(|(?:\bnew\s+Function|Function)\s*\(|setTimeout\s*\(\s*["'`]""",
+        # 基础 pattern 只覆盖 Python：原来的 |Function) 分支没有左边界，
+        # 加上 (?is) 后 `iscoroutinefunction(`、`this_function(` 全部命中
+        # ——这是 stdlib 上 175 条误报的主因。JS/PHP 各用自己的写法。
+        pattern=r"""(?is)(?<![A-Za-z0-9_])(?:eval|exec|execfile)\s*\(""",
+        pattern_by_lang={
+            "javascript": r"""(?is)(?<![A-Za-z0-9_$])(?:eval|Function)\s*\(|(?<![A-Za-z0-9_$])new\s+Function\s*\(|setTimeout\s*\(\s*["'`]""",
+            "typescript": r"""(?is)(?<![A-Za-z0-9_$])(?:eval|Function)\s*\(|(?<![A-Za-z0-9_$])new\s+Function\s*\(|setTimeout\s*\(\s*["'`]""",
+            "php": r"""(?is)(?<![A-Za-z0-9_])(?:eval|create_function|assert)\s*\(""",
+        },
         safe_when=[r"(?i)ast\.literal_eval|json\.parse|\.eval\s*\(\s*\)"],
         root_cause_hint="字符串被当作代码解析执行，一旦内容可被外部影响，就等于把解释器交给了攻击者。",
         fix_hint="用显式映射表或 AST 白名单替代动态求值；确实需要表达式时用 literal_eval / 受限解析器。",
@@ -202,7 +237,9 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-295"],
         owasp=["A07:2021"],
         languages=["python", "javascript", "typescript", "go", "java"],
-        pattern=r"""(?is)(?:verify\s*=\s*False|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*["']?0|TrustAllCerts|checkServerIdentity\s*:\s*\(\s*\)\s*=>|_create_unverified_context|CERT_NONE|check_hostname\s*=\s*False)""",
+        # CERT_NONE 只能出现在「赋值/传参」位置：`verify_mode != CERT_NONE`
+        # 是正常校验逻辑，原来会误报（stdlib 的 ssl.py 就被打中）
+        pattern=r"""(?is)(?:verify\s*=\s*False|rejectUnauthorized\s*:\s*false|InsecureSkipVerify\s*:\s*true|NODE_TLS_REJECT_UNAUTHORIZED\s*=\s*["']?0|TrustAllCerts|checkServerIdentity\s*:\s*\(\s*\)\s*=>|_create_unverified_context|(?:verify_mode|CERT_NONE)\s*=\s*(?:ssl\.)?CERT_NONE|check_hostname\s*=\s*False)""",
         safe_when=[],
         root_cause_hint="关闭证书校验后，中间人可以用任意证书冒充服务端，加密通道形同虚设。",
         fix_hint="恢复校验证书链与主机名；自签场景改为显式信任指定 CA，而不是全局关闭。",
@@ -232,6 +269,8 @@ BUILTIN_RULES: list[Rule] = _r(
         languages=["python", "javascript", "typescript", "go", "java", "php"],
         pattern=r"""(?is)(?:\border\s+by\b[^;]{0,80}(?:\+\s*\w|\$\{|\{\w*\}|%s["']?\s*%|\|\|)|["']\s*\+\s*\w+\s*\+\s*["']\s*(?:asc|desc|limit))""",
         safe_when=[r"(?i)ORDER_BY_SAFE|allowed_sort|SAFE_COLUMNS|whitelist|allowlist"],
+        # 命中点就在 SQL 字符串内部（"ORDER BY " + col），不能做字符串过滤
+        allow_in_strings=True,
         root_cause_hint="列名和排序方向属于 SQL 语法结构，不能用参数占位符表达，一旦可被外部输入改变就等于把排序子句交给了攻击者。",
         fix_hint="用白名单映射：外部传入的字段名先查表，映射到固定的列名字面量，查不到就用默认列。",
         references=["https://cwe.mitre.org/data/definitions/89.html"],
@@ -334,8 +373,13 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-22"],
         owasp=["A01:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php"],
-        pattern=r"""(?is)(?:\.extractall\s*\(|\.extract\s*\(\s*[^)\n]{0,100}(?:member|name|filename|entry)|tarfile\.(?:open|extractall)|ZipFile\s*\([^)]*\)\s*\.\s*extract)""",
-        safe_when=[r"(?i)realpath|commonpath|is_relative_to|secure_|basename|resolve\(\).*startswith"],
+        # tarfile.open 只是打开，不是解压，原来把它算进来纯属噪音；
+        # 解压侧要认 extractall / extract(member=...)，以及 3.12 起的 filter= 修复。
+        pattern=r"""(?is)(?:\.extractall\s*\(|\.extract\s*\(\s*[^)\n]{0,100}(?:member|name|filename|entry)|tarfile\.extractall|ZipFile\s*\([^)]*\)\s*\.\s*extract)""",
+        safe_when=[
+            r"(?i)realpath|commonpath|is_relative_to|secure_|basename|resolve\(\).*startswith",
+            r"(?i)extractall\s*\([^)]*\bfilter\s*=",  # 3.12+ 的 filter="data"
+        ],
         root_cause_hint="压缩包内的条目名可以包含 ../，直接解压会把文件写到目标目录之外，覆盖任意可写路径。",
         fix_hint="解压前把条目的规范化绝对路径与目标根目录做前缀比较，越界就拒绝。",
         references=["https://cwe.mitre.org/data/definitions/22.html"],
@@ -425,7 +469,11 @@ BUILTIN_RULES: list[Rule] = _r(
         cwe=["CWE-208"],
         owasp=["A02:2021"],
         languages=["python", "javascript", "typescript", "go", "java", "php"],
-        pattern=r"""(?is)if\s+(?:[\w.]*)(?:password|passwd|token|secret|hmac|digest|signature)[\w.]*\s*==\s*[\w.]+\s*:""",
+        # 去掉 token：歧义太大，`tokenL == 0xF` 这类比较会被误判。
+        # 并且排除右侧是数字字面量的比较（那不是凭据比对）。
+        # 关键词允许出现在标识符任意位置（expected_signature 也要报），
+        # 但去掉 token 这个歧义太大的词，并排除与数字字面量比较
+        pattern=r"""(?is)\bif\s+[\w.]*(?:password|passwd|secret|hmac|digest|signature|api[_-]?key)[\w.]*\s*==\s*(?![\d.])[\w.]+""",
         safe_when=[r"(?i)compare_digest|timingSafeEqual|constant_time|hmac\.compare|secrets\.compare|crypto\.timingSafeEqual"],
         root_cause_hint="字符串 == 会在首个不同字节处提前返回，攻击者可以通过响应时间差逐字节推断出正确值。",
         fix_hint="改用 hmac.compare_digest / crypto.timingSafeEqual 这类恒定时间比较。",
@@ -453,7 +501,7 @@ BUILTIN_RULES: list[Rule] = _r(
         languages=["python", "javascript", "typescript", "java", "php"],
         # 三条分支：Python 的 XMLParser / lxml 解析、Java 的 DocumentBuilderFactory、
         # PHP 的 libxml 相关开关与直接 loadXML
-        pattern=r"""(?is)(?:\b(?:etree\.XMLParser|XMLParser|lxml\.etree\.(?:fromstring|parse)|ElementTree\.parse|xml\.dom\.minidom\.parse(?:String)?)\s*\(|DocumentBuilderFactory\.newInstance\s*\(\s*\)|libxml_disable_entity_loader\s*\(\s*(?:false|0)\s*\)|setFeature\s*\(\s*["'][^"']*disallow-doctype-decl[^"']*["']\s*,\s*false\s*\)|(?:simplexml_load_string|DOMDocument\s*->\s*loadXML)\s*\()""",
+        pattern=r"""(?is)(?:\b(?:etree\.XMLParser|XMLParser|lxml\.etree\.(?:fromstring|parse)|xml\.dom\.minidom\.parse(?:String)?)\s*\(|DocumentBuilderFactory\.newInstance\s*\(\s*\)|libxml_disable_entity_loader\s*\(\s*(?:false|0)\s*\)|setFeature\s*\(\s*["'][^"']*disallow-doctype-decl[^"']*["']\s*,\s*false\s*\)|(?:simplexml_load_string|DOMDocument\s*->\s*loadXML)\s*\()""",
         safe_when=[
             r"(?i)resolve_entities\s*=\s*False|no_network\s*=\s*True|forbid_dtd\s*=\s*True",
             r"(?i)defusedxml|defused",
@@ -466,6 +514,168 @@ BUILTIN_RULES: list[Rule] = _r(
         references=["https://cwe.mitre.org/data/definitions/611.html"],
     ),
 )
+
+
+# ---------------------------------------------------------------- 规则分级
+
+# 把握度按「误报面」定，不按危害定：危害决定 severity，把握度决定默认报不报。
+# 新增规则必须在这里登记，否则 test_rules_have_confidence 会失败——避免新规则
+# 悄悄以 MEDIUM 混进默认档。
+_CONFIDENCE_BY_ID: dict[str, Confidence] = {
+    # 模式明确、几乎没有别的解释
+    "bee.sql-injection": Confidence.HIGH,
+    "bee.command-injection": Confidence.HIGH,
+    "bee.unsafe-deserialization": Confidence.HIGH,
+    "bee.path-traversal": Confidence.HIGH,
+    "bee.zip-slip": Confidence.HIGH,
+    "bee.xxe": Confidence.HIGH,
+    "bee.jwt-verify-disabled": Confidence.HIGH,
+    "bee.prototype-pollution": Confidence.HIGH,
+    "bee.private-key-hardcoded": Confidence.HIGH,
+    "bee.cloud-credential": Confidence.HIGH,
+    "bee.code-injection": Confidence.HIGH,
+    "bee.nosql-injection": Confidence.HIGH,
+    "bee.ssti": Confidence.HIGH,
+    "bee.ldap-injection": Confidence.HIGH,
+    "bee.dynamic-order-by": Confidence.HIGH,
+    # 需要看上下文才能确认
+    "bee.hardcoded-credential": Confidence.MEDIUM,
+    "bee.weak-crypto": Confidence.MEDIUM,
+    "bee.xss": Confidence.MEDIUM,
+    "bee.ssrf": Confidence.MEDIUM,
+    "bee.tls-verify-disabled": Confidence.MEDIUM,
+    "bee.insecure-cookie": Confidence.MEDIUM,
+    "bee.unrestricted-upload": Confidence.MEDIUM,
+    # 启发式，只在 full 档报
+    "bee.insecure-random": Confidence.LOW,
+    "bee.timing-attack": Confidence.LOW,
+    "bee.debug-enabled": Confidence.LOW,
+    "bee.csrf-disabled": Confidence.LOW,
+    "bee.cors-wildcard": Confidence.LOW,
+    "bee.open-redirect": Confidence.LOW,
+    "bee.sensitive-data-logging": Confidence.LOW,
+    "bee.redos": Confidence.LOW,
+}
+
+# 命中天然落在字符串内部的规则：PEM 私钥、AKIA/云厂商密钥本身就是字符串常量，
+# 被字符串过滤掉就永远报不出来。
+_ALLOW_IN_STRINGS = {"bee.private-key-hardcoded", "bee.cloud-credential"}
+
+for _rule in BUILTIN_RULES:
+    if _rule.id in _CONFIDENCE_BY_ID:
+        _rule.confidence = _CONFIDENCE_BY_ID[_rule.id]
+    # 只加不减：规则自己声明了 allow_in_strings=True 的（如 dynamic-order-by）
+    # 不能被这张表覆盖掉
+    if _rule.id in _ALLOW_IN_STRINGS:
+        _rule.allow_in_strings = True
+
+
+# ---------------------------------------------------------------- 误报抑制启发式
+
+# token_type / api_key_name / secret_len 这类名字里的关键词只是名字的一部分，
+# 值也不是密钥。凭据规则的 recall 从来不缺，缺的是 precision。
+_WEAK_NAME_SUFFIX = (
+    "_type", "_name", "_len", "_length", "_count", "_size", "_kind",
+    "_label", "_text", "_mode", "_status", "_limit", "_field", "_path",
+)
+
+_PLACEHOLDER_RE = re.compile(
+    r"(?i)example|dummy|sample|placeholder|change.?me|your|xxx+|\*\*\*|redacted|<[^>]+>|\$\{"
+)
+
+
+def looks_like_secret(name: str, value: str) -> bool:
+    """判断「名字像凭据 + 值像密钥」是否真的成立。
+
+    三道门：名字不是 *_type 这类元信息、值不是占位符、值足够长且字符种类够杂。
+    单靠宽松正则会把 `token_type = 'unstructured'` 当成密钥——
+    stdlib 上 44 条里几乎全是这一类。
+    """
+    if name.lower().endswith(_WEAK_NAME_SUFFIX):
+        return False
+    if _PLACEHOLDER_RE.search(value):
+        return False
+    if len(value) < 12:
+        return False
+    classes = sum(
+        1 for pattern in (r"[a-z]", r"[A-Z]", r"\d", r"[^A-Za-z0-9]")
+        if re.search(pattern, value)
+    )
+    return classes >= 2
+
+
+# ---------------------------------------------------------------- 字符串/注释区间
+
+def _line_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for line in text.splitlines(keepends=True):
+        offsets.append(offsets[-1] + len(line))
+    return offsets
+
+
+def _string_spans_python(text: str) -> list[tuple[int, int]]:
+    """用 tokenize 取 Python 的 STRING/COMMENT 区间（能正确处理三引号与转义）。"""
+    spans: list[tuple[int, int]] = []
+    offsets = _line_offsets(text)
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type in (tokenize.STRING, tokenize.COMMENT):
+                start = offsets[tok.start[0] - 1] + tok.start[1]
+                end = offsets[tok.end[0] - 1] + tok.end[1]
+                spans.append((start, end))
+    except (tokenize.TokenError, IndentationError, SyntaxError):
+        return []
+    return spans
+
+
+def _string_spans_generic(text: str) -> list[tuple[int, int]]:
+    """其它语言的轻量扫描：引号字符串 + // 与 /* */ 注释。
+
+    不追求完备（模板字符串嵌套之类会漏），目标是把「文档里的示例代码」
+    这类噪音挡掉，漏判方向是宁可多报。
+    """
+    spans: list[tuple[int, int]] = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            spans.append((i, j))
+            i = j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            spans.append((i, j))
+            i = j
+        elif text[i] in "\"'`":
+            quote, j = text[i], i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == quote:
+                    j += 1
+                    break
+                if text[j] == "\n" and quote != "`":
+                    # 未闭合的引号：当成到行尾，避免把整个文件吞掉
+                    j += 1
+                    break
+                j += 1
+            spans.append((i, j))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
+def _string_spans(text: str, lang: str) -> list[tuple[int, int]]:
+    if lang == "python":
+        return _string_spans_python(text)
+    return _string_spans_generic(text)
+
+
+def _inside(index: int, spans: list[tuple[int, int]]) -> bool:
+    return any(start <= index < end for start, end in spans)
 
 
 # ---------------------------------------------------------------- 引擎
@@ -550,11 +760,23 @@ def iter_source_files(
     include_globs: list[str] | None = None,
     exclude_globs: list[str] | None = None,
 ) -> list[Path]:
+    """枚举待扫描文件。
+
+    SKIP_DIRS 必须按**相对 root 的路径**判断。用绝对路径判断会把
+    「目标本身就在某个被跳过的名字下」的情况整棵树灭掉——
+    例如目标解析后落在 .../vendor/python/Lib，`vendor` 命中 SKIP_DIRS，
+    结果 0 个文件却报告「无问题」。这比误报严重得多。
+    """
+    root = root.resolve()
     files: list[Path] = []
     for p in root.rglob("*"):
         if not p.is_file():
             continue
-        if any(part in SKIP_DIRS for part in p.parts):
+        try:
+            rel_parts = p.relative_to(root).parts
+        except ValueError:
+            rel_parts = p.parts
+        if any(part in SKIP_DIRS for part in rel_parts[:-1]):
             continue
         if p.name in SKIP_FILENAMES or p.suffix.lower() == ".sarif":
             continue
@@ -824,12 +1046,18 @@ def scan_file(path: Path, root: Path, rules: list[Rule] | None = None) -> list[F
     rel = str(path.relative_to(root)).replace("\\", "/")
     source_lines = text.splitlines()
     findings: list[Finding] = []
+    # 每个文件只算一次字符串/注释区间：文档和测试里的示例代码是最大噪音源
+    # （stdlib 上 46% 的命中落在 STRING token 里）
+    spans = _string_spans(text, lang)
 
     for rule in rules:
         if lang not in rule.languages:
             continue
+        pattern = rule.pattern_by_lang.get(lang, rule.pattern)
+        if not pattern:
+            continue
         try:
-            matches = list(re.finditer(rule.pattern, text))
+            matches = list(re.finditer(pattern, text))
         except re.error:
             continue
         if not matches:
@@ -840,6 +1068,8 @@ def scan_file(path: Path, root: Path, rules: list[Rule] | None = None) -> list[F
 
         seen_lines: set[int] = set()
         for m in matches:
+            if not rule.allow_in_strings and _inside(m.start(), spans):
+                continue
             start_line = _line_of(text, m.start())
             if start_line in seen_lines:
                 continue
@@ -851,6 +1081,10 @@ def scan_file(path: Path, root: Path, rules: list[Rule] | None = None) -> list[F
             # 参数化查询里，参数值自己做拼接是安全的：拼接发生在应用层，不进 SQL 文本
             if rule.id == "bee.sql-injection" and _is_parameterized_sql_call(text, m.start()):
                 continue
+            # 凭据规则必须再看一眼名字与值：正则只负责找到「像赋值」的地方
+            if rule.id == "bee.hardcoded-credential" and m.lastindex and m.lastindex >= 3:
+                if not looks_like_secret(m.group(1), m.group(3)):
+                    continue
             seen_lines.add(start_line)
             code_line = source_lines[start_line - 1].strip() if 0 < start_line <= len(source_lines) else ""
             findings.append(
@@ -895,6 +1129,9 @@ def scan_tree(
     only_paths: list[str] | None = None,
     exclude_globs: list[str] | None = None,
 ) -> list[Finding]:
+    # iter_source_files 内部会 resolve；这里同步一次，否则符号链接目录下
+    # scan_file 里的 relative_to 会直接抛 ValueError
+    root = root.resolve()
     targets = iter_source_files(root, include_globs, exclude_globs)
     if only_paths:
         wanted = {p.replace("\\", "/") for p in only_paths}

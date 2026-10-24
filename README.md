@@ -4,6 +4,14 @@
 
 零第三方依赖，纯标准库，Windows / macOS / Linux 都能直接跑。
 
+```bash
+pipx install bee-scanner      # 或 pip install bee-scanner
+bee --version                 # bee 1.1.0
+bee scan ./your-project       # 先看有什么，纯静态、只读
+```
+
+不想装也能用：`git clone` 之后 `python -m bee scan ./your-project`。
+
 > **关于本仓库的来源**：早期版本基于 [vxcontrol/pentagi](https://github.com/vxcontrol/pentagi)
 > （MIT）修改，未实现其声称的能力，已被完全替换。当前版本是从零重写的独立实现，
 > 不含 PentAGI 的源代码。详细说明见 [NOTICE](NOTICE)。
@@ -242,6 +250,11 @@ GitLab SAST 报告消费。
 --include 'src/**/*.py'               只扫匹配的文件（支持 ** 跨目录）
 --exclude 'tests/**'                  排除匹配的文件（支持 ** 跨目录）
 --limit 10                            只处理前 N 条
+--profile {strict,default,full}       规则档位：strict 只报高把握，full 含全部启发式
+--input PATH.sarif                    从外部 SARIF 读 finding，跳过内置检测
+--max-findings 20                     最多处理多少条（0=不限）
+--max-llm-calls 120                   模型调用次数上限（估算）
+--max-seconds 1800                    墙钟时间上限
 --rounds 3                            每个漏洞最多重试轮次（默认 3）
 --run-tests                           运行被审计仓库的测试做回归（默认关闭）
 --no-tests                            强制不跑测试（兼容旧用法，等价默认值）
@@ -383,6 +396,25 @@ Precision 100.0%   Recall 100.0%   F1 100.0%
 这个数字不要当准确率对外引用（见下方已知限制第 9 条），它的用途是回归：
 改规则时如果 FN 或 FP 变了，CI 会立刻告诉你。
 
+### 真实语料上的噪音
+
+构造样本证明不了真实项目里的表现。`benchmark/realworld.py` 换成真实代码：
+
+```bash
+python benchmark/realworld.py --check          # 超阈值退出码 1
+python benchmark/realworld.py --sample 12      # 生成人工标注表
+```
+
+| 语料 | 发现数（v1.0.0 → v1.1.0） | 说明 |
+| --- | --- | --- |
+| CPython stdlib（536 文件） | 321 → **77** | 词边界、按语言拆分、字符串过滤、凭据启发式 |
+| 本机 site-packages | — → **18** | 第三方包的 tls / code-injection 命中 |
+| bee 自身 | 0 → **0** | 自扫必须保持干净 |
+
+剩下的 77 条大多是**真实的危险 API 调用**（`eval` 在调试器里、`marshal.loads`
+在 importlib 里）——规则只看单行，分不清「实现这个功能」和「误用这个功能」。
+这就是为什么报告必须人 review。详细拆解见 [docs/validation.md](docs/validation.md)。
+
 ---
 
 ## 已知限制
@@ -414,7 +446,15 @@ Precision 100.0%   Recall 100.0%   F1 100.0%
 9. **benchmark 的数字偏乐观。** `benchmark/cases` 里的样本是照着规则能力写的，
    16/16 命中只证明「规则按设计工作」，不代表真实项目的检出率。它适合进 CI
    看回归趋势，不适合当准确率指标对外引用。
-10. **大仓库的成本有上限但没有硬预算。** 调用方搜索最多扫 2000 个文件、单条
+10. **stdlib 上的 77 条里仍有误报，别把「噪音下降」当成「准确」。** 标准库是
+    `eval`/`pickle` 这些危险 API 的实现方，天然会被打中。要测真实 FP 率需要
+    **应用代码 + 人工标注**的语料，目前还没有——这是 v1.1.0 明确缺口。规则层
+    建议用 `--profile strict` 进门禁，`default` 给人看。
+11. **`--input` 导入的 finding 无法验证「漏洞消失」。** 外部规则不在 bee 内，
+    重扫会得到假的「已修复」，所以 `finding_gone` 记为 `None`，这类补丁永远不会
+    显示「已验证」。要完整验证就补一条等价的自定义规则（见
+    [docs/semgrep-integration.md](docs/semgrep-integration.md)）。
+12. **大仓库的成本有上限但没有硬预算。** 调用方搜索最多扫 2000 个文件、单条
     finding 的上下文有字符预算，但每条补丁仍要复制一次完整项目、`--run-tests`
     时还要跑一遍全量测试。几十万行的仓库建议先 `--limit` / `--min-severity`。
 
@@ -461,7 +501,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # 检测层准确率回归
 ```
 
-110 个用例覆盖九块：
+138 个用例覆盖十一块：
 
 - `tests/test_verify.py` —— 四项信号是否真的在拦截（含"能应用能编译但没修好"、
   "语法被改坏"、沙箱隔离三个关键用例）
@@ -477,6 +517,7 @@ python benchmark/run.py --strict      # 检测层准确率回归
 - `tests/test_detect.py` —— 单条规则的判定边界，重点是 `safe_when` 压制是否生效
   （参数化 SQL、`shell=False`、`resolve_entities=False`、YAML 环境变量注入、
   f-string 白名单表名 vs `request.args` 用户输入）
+- `tests/test_inputs.py` —— 外部 SARIF 导入（字段映射、去重、未重扫状态）
 - `tests/test_audit_fixes.py` —— 外部审计的验收场景：红基线不误判、自定义规则
   finding_gone 不恒真、`--exclude` 的 `**` 语义、编造证据被打回、路径穿越与
   符号链接被拒绝、测试子进程环境变量剥离、`scan -o` 与 `--fail-on-findings`
@@ -484,6 +525,18 @@ python benchmark/run.py --strict      # 检测层准确率回归
 跑法不依赖 pytest。
 
 ---
+
+## 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [docs/scope.md](docs/scope.md) | **适用范围与边界**：它不是什么、能不能当门禁、`finding_gone` 证明什么 |
+| [docs/validation.md](docs/validation.md) | 检测层真实数据：stdlib 321→77 的拆解、剩余命中的性质 |
+| [docs/semgrep-integration.md](docs/semgrep-integration.md) | 把 Semgrep / CodeQL 的结果接进来，bee 只做修复层 |
+| [docs/ci.md](docs/ci.md) | GitHub Actions / GitLab / Jenkins / pre-commit 接入 |
+| [docs/docker.md](docs/docker.md) | 在容器里跑 `fix`（隔离目标仓库的代码执行） |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | 开发环境、写规则的步骤、PR 要求 |
+| [SECURITY.md](SECURITY.md) | 漏洞报告流程、安全边界 |
 
 ## 来源与许可
 

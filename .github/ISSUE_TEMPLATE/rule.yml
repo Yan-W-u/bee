@@ -1,0 +1,55 @@
+name: 规则问题（误报 / 漏报）
+description: 某条规则在该报的时候没报，或不该报的时候报了
+labels: ["rules"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        规则问题**必须**带可复现的最小代码片段（3–10 行）。
+        没有片段的报告没法修——我们不会凭描述改正则。
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 类型
+      options:
+        - 误报（报了不该报的）
+        - 漏报（该报的没报）
+    validations:
+      required: true
+  - type: input
+    id: rule
+    attributes:
+      label: 规则 id 或标题
+      placeholder: bee.code-injection / 动态代码执行
+    validations:
+      required: true
+  - type: input
+    id: profile
+    attributes:
+      label: 档位
+      placeholder: default（默认）/ strict / full
+    validations:
+      required: false
+  - type: textarea
+    id: snippet
+    attributes:
+      label: 最小复现代码
+      description: 直接贴代码，不要贴截图。能用 3 行复现就不要贴 300 行。
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: 为什么它不该报（或该报）
+      description: 例如「这是白名单映射出来的固定列名，用户输入走占位符」
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: 复现命令
+      render: shell
+      placeholder: bee scan ./repo --rule bee.code-injection --json
+    validations:
+      required: false

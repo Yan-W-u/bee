@@ -1,0 +1,17 @@
+{
+  "_doc": "阈值。max_findings 按当前实测留出余量：目的是抓「误报回涨」，不是卡死具体数字。",
+  "python-stdlib": {
+    "max_findings": 130,
+    "max_seconds": 120,
+    "baseline_v1_0_0": 321,
+    "current_v1_1_0": 81
+  },
+  "site-packages": {
+    "max_findings": 400,
+    "max_seconds": 180
+  },
+  "self": {
+    "max_findings": 0,
+    "max_seconds": 30
+  }
+}

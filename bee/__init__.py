@@ -10,7 +10,7 @@ from .models import Explanation, Finding, PatchAttempt, RepairResult, Severity
 from .patch import repair_finding
 from .verify import EditProposal, verify_patch
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = [
     "Explanation",

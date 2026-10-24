@@ -24,6 +24,9 @@ DEFAULTS = {
 }
 
 ENV_BASE = "BEE_LLM_BASE_URL"
+# 提示词或输出协议变化时递增：报告里会带上它，便于复现历史结论
+PROMPT_VERSION = "2026-10-24.1"
+
 ENV_KEY = "BEE_LLM_API_KEY"
 ENV_MODEL = "BEE_LLM_MODEL"
 

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "CodeQL",
+          "rules": [
+            {"id": "py/command-line-injection", "defaultConfiguration": {"level": "error"}}
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "py/command-line-injection",
+          "message": {"text": "This command line depends on a user-provided value."},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "bots/runner.py"},
+                "region": {"startLine": 40, "endLine": 40}
+              }
+            }
+          ],
+          "properties": {"cwe": ["CWE-78"]}
+        },
+        {
+          "ruleId": "py/command-line-injection",
+          "message": {"text": "duplicate result for the same line"},
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {"uri": "bots/runner.py"},
+                "region": {"startLine": 40}
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
