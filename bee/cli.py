@@ -463,7 +463,22 @@ def cmd_audit_or_fix(args: argparse.Namespace, do_fix: bool) -> int:
     return _emit(args, results, target, files)
 
 
+def _force_utf8_output() -> None:
+    """把 stdout/stderr 切到 UTF-8。
+
+    报告和进度提示都是中文。CI 里如果 locale 是 C/POSIX，Python 3.12 的
+    stdout 编码会是 ascii，第一次 print 中文就抛 UnicodeEncodeError——
+    工具本身没问题，却在最不该挂的地方挂掉。这里统一兜住。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            continue
+
+
 def main(argv: list[str] | None = None) -> int:
+    _force_utf8_output()
     parser = build_parser()
     args = parser.parse_args(argv)
 

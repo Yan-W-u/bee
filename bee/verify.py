@@ -688,6 +688,12 @@ def apply_session(root: Path, session: PatchSession) -> tuple[int, list[str]]:
     errors: list[str] = []
 
     for rel in order:
+        # 符号链接必须在 safe_join 之前判：safe_join 会 resolve，指向外部的链接
+        # 会先被当成「路径越界」报出来，掩盖真正的原因（也让使用者不知道是链接）。
+        raw_target = root / rel
+        if raw_target.is_symlink() or os.path.islink(raw_target):
+            errors.append(f"{rel}: 拒绝写入符号链接（可能指向项目外）")
+            continue
         try:
             target = safe_join(root, rel)
             _write_guard(target, root, rel)

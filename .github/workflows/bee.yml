@@ -22,10 +22,20 @@ jobs:
         with:
           python-version: "3.12"
 
-      # 每次 push 都跑。改规则/验证层时这里的红比扫描结果先到，
-      # 不必等到每周一的全量工作流。
       - name: 单元测试
-        run: python -m unittest discover -s tests -v
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set +e
+          python -m unittest discover -s tests -v 2>&1 | tee /tmp/bee-unittest.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            # 把失败摘要写进 annotation，否则日志只能登录网页看
+            detail=$(grep -E '^(FAIL|ERROR):' -A 6 /tmp/bee-unittest.log | tr '\n' '~' | head -c 1200)
+            echo "::error title=单元测试失败::${detail}"
+            tail -40 /tmp/bee-unittest.log
+            exit "$rc"
+          fi
 
       - name: 规则 benchmark（有 FN/FP 则失败）
         run: python benchmark/run.py --strict
@@ -33,6 +43,8 @@ jobs:
   scan:
     name: 漏洞扫描
     runs-on: ubuntu-latest
+    env:
+      PYTHONIOENCODING: utf-8
     steps:
       - uses: actions/checkout@v7
         with:
@@ -46,8 +58,16 @@ jobs:
         run: |
           if [ ! -f .bee-baseline.json ]; then
             echo "::notice::未找到基线文件，本次扫描全量写入 .bee-baseline.json。下载 artifact 并提交它之后，后续只报新增问题。"
+            set +e
             python -m bee scan . --write-baseline .bee-baseline.json --sarif bee.sarif \
-              --exclude 'samples/**' --exclude 'benchmark/cases/**' --exclude 'tests/**' --exclude 'examples/**'
+              --exclude 'samples/**' --exclude 'benchmark/cases/**' --exclude 'tests/**' --exclude 'examples/**' \
+              2>&1 | tee /tmp/bee-scan.log
+            rc=${PIPESTATUS[0]}
+            if [ "$rc" -ne 0 ]; then
+              detail=$(tail -25 /tmp/bee-scan.log | tr '\n' '~' | head -c 1200)
+              echo "::error title=扫描失败::${detail}"
+              exit "$rc"
+            fi
             echo "BOOTSTRAP=1" >> "$GITHUB_ENV"
           fi
 
