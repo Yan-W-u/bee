@@ -264,6 +264,10 @@ full data exposure get 9.8, ordinary injection 8.0, informational 3.5.
 Findings with a taint path emit `codeFlows`, so GitHub can expand the path showing where the
 data came from.
 
+Every command keeps a strict stdout/stderr split: `--json` puts the JSON document and nothing
+else on stdout, while progress lines and "written to ..." notices go to stderr. So
+`bee scan --json --sarif out.sarif > findings.json` produces a file that parses.
+
 ---
 
 ### Common flags
@@ -290,7 +294,7 @@ data came from.
 --fail-on-new                         exit code 1 when there are new issues
 --fail-on-findings                    exit code 1 whenever findings remain (CI gate)
 --sarif PATH                          emit SARIF 2.1.0
---json                                structured output
+--json                                structured output (stdout carries JSON only; notices go to stderr)
 --apply --yes                         write to disk (backup first)
 ```
 
@@ -553,7 +557,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # detection-layer accuracy regression
 ```
 
-138 cases across eleven areas:
+143 cases across eleven areas:
 
 - `tests/test_verify.py` — do the four signals actually block? (including "applies and
   compiles but does not fix", "syntax broken", and sandbox isolation)
@@ -575,7 +579,7 @@ python benchmark/run.py --strict      # detection-layer accuracy regression
 - `tests/test_audit_fixes.py` — acceptance scenarios from an external audit: red baseline is
   not misjudged, custom-rule `finding_gone` is not trivially true, `--exclude` `**` semantics,
   fabricated evidence rejected, path traversal and symlinks refused, test-subprocess env
-  stripping, `scan -o` and `--fail-on-findings`
+  stripping, `scan -o` and `--fail-on-findings`, and `--json` leaving nothing else on stdout
 
 No pytest required.
 
@@ -855,6 +859,10 @@ GitLab SAST 报告消费。
 
 有污点路径的发现会输出 `codeFlows`，在 GitHub 上能展开看数据从哪流进来的。
 
+所有命令都守一条 stdout/stderr 约定：`--json` 时 stdout 只有那个 JSON 文档，进度与
+「已写入 …」这类提示一律走 stderr。所以 `bee scan --json --sarif out.sarif > findings.json`
+拿到的文件可以直接解析。
+
 ---
 
 ### 常用参数
@@ -881,7 +889,7 @@ GitLab SAST 报告消费。
 --fail-on-new                         有新增问题时退出码 1
 --fail-on-findings                    还有发现就退出码 1（CI 门禁）
 --sarif PATH                          输出 SARIF 2.1.0
---json                                结构化输出
+--json                                结构化输出（stdout 只有 JSON，提示信息走 stderr）
 --apply --yes                         落盘（先备份）
 ```
 
@@ -1121,7 +1129,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # 检测层准确率回归
 ```
 
-138 个用例覆盖十一块：
+143 个用例覆盖十一块：
 
 - `tests/test_verify.py` —— 四项信号是否真的在拦截（含"能应用能编译但没修好"、
   "语法被改坏"、沙箱隔离三个关键用例）
@@ -1140,7 +1148,8 @@ python benchmark/run.py --strict      # 检测层准确率回归
 - `tests/test_inputs.py` —— 外部 SARIF 导入（字段映射、去重、未重扫状态）
 - `tests/test_audit_fixes.py` —— 外部审计的验收场景：红基线不误判、自定义规则
   finding_gone 不恒真、`--exclude` 的 `**` 语义、编造证据被打回、路径穿越与
-  符号链接被拒绝、测试子进程环境变量剥离、`scan -o` 与 `--fail-on-findings`
+  符号链接被拒绝、测试子进程环境变量剥离、`scan -o` 与 `--fail-on-findings`、
+  `--json` 的 stdout 不混入任何提示
 
 跑法不依赖 pytest。
 

@@ -486,12 +486,13 @@ class TestBaselineAppliesToAudit(unittest.TestCase):
                   "--write-baseline", str(self.bl)])
         self.assertTrue(self.bl.exists())
 
-        buf = io.StringIO()
-        with redirect_stdout(buf), redirect_stderr(io.StringIO()):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
             code = main(["audit", str(self.tmp), "--detector", "rules",
                          "--no-llm", "--baseline", str(self.bl)])
         self.assertEqual(code, 0)
-        self.assertIn("未发现问题", buf.getvalue())
+        # 状态提示改走 stderr，stdout 只留报告/JSON，管道里不再混入提示
+        self.assertIn("未发现问题", err.getvalue())
 
     def test_audit_fail_on_new_after_baseline(self):
         buf = io.StringIO()
@@ -528,6 +529,75 @@ class TestBudget(unittest.TestCase):
 
         r = RepairResult(finding=make_finding(), skipped_reason="已达 --max-findings=20")
         self.assertEqual(r.status, "skipped")
+
+
+class TestStdoutIsPureJson(unittest.TestCase):
+    """`--json` 时 stdout 只能是那个 JSON 文档。
+
+    周扫 CI 的「汇总」步骤挂在 json.loads 的 Extra data 上，根因就是
+    `--sarif` 的「已写入」提示打到了 stdout。这类污染只有解析一次才能发现，
+    所以每个会往 stdout 写东西的旁路都单独锁一条。
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="bee-json-"))
+        (self.tmp / "app.py").write_text(
+            'API_TOKEN = "prod_api_token_9f3c1a77"\n', encoding="utf-8"
+        )
+
+    def tearDown(self) -> None:
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, argv: list[str]) -> str:
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main(argv)
+        self.assertEqual(code, 0, err.getvalue()[-600:])
+        return out.getvalue()
+
+    def test_scan_json_with_sarif_stays_parseable(self):
+        raw = self._run([
+            "scan", str(self.tmp), "--detector", "rules", "--json",
+            "--sarif", str(self.tmp / "out.sarif"),
+        ])
+        data = json.loads(raw)          # Extra data 会在这里炸
+        self.assertEqual(len(data), 1)
+
+    def test_scan_json_with_report_stays_parseable(self):
+        raw = self._run([
+            "scan", str(self.tmp), "--detector", "rules", "--json",
+            "-o", str(self.tmp / "report.md"),
+        ])
+        json.loads(raw)
+
+    def test_scan_json_with_baseline_stays_parseable(self):
+        raw = self._run([
+            "scan", str(self.tmp), "--detector", "rules", "--json",
+            "--write-baseline", str(self.tmp / "bl.json"),
+        ])
+        json.loads(raw)
+
+    def test_audit_clean_project_emits_empty_array(self):
+        clean = Path(tempfile.mkdtemp(prefix="bee-json-clean-"))
+        try:
+            (clean / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            raw = self._run([
+                "audit", str(clean), "--detector", "rules", "--no-llm", "--json",
+            ])
+            self.assertEqual(json.loads(raw), [])
+        finally:
+            shutil.rmtree(clean, ignore_errors=True)
+
+    def test_fix_clean_project_emits_empty_array(self):
+        clean = Path(tempfile.mkdtemp(prefix="bee-json-clean2-"))
+        try:
+            (clean / "ok.py").write_text("x = 1\n", encoding="utf-8")
+            raw = self._run([
+                "fix", str(clean), "--detector", "rules", "--no-llm", "--json",
+            ])
+            self.assertEqual(json.loads(raw), [])
+        finally:
+            shutil.rmtree(clean, ignore_errors=True)
 
 
 if __name__ == "__main__":

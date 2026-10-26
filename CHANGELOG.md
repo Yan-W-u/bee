@@ -2,8 +2,23 @@
 
 ## Unreleased
 
+### 修复
+
+- **`--json` 的 stdout 被提示信息污染**：`--sarif` / `-o` / `--write-baseline` 写完文件后
+  会往 stdout 打「已写入 …」，与 JSON 文档混在一行之外，`json.loads` 直接报
+  `Extra data`。周扫 CI 的「汇总」步骤就是这么红的（第一次定时运行才发现）。
+  现在提示一律走 stderr，stdout 只留报告或 JSON。
+- `audit` / `fix` 在无发现时不再用中文提示顶替 JSON：`--json` 输出 `[]`。
+  `--apply` 的交互提示也改走 stderr。
+- 补 5 条回归测试：`--json` 分别叠加 `--sarif` / `-o` / `--write-baseline` 时都必须
+  可解析，`audit` / `fix` 空结果必须是 `[]`。
+- 周扫的「汇总」步骤解析失败时输出 `::error` annotation（含文件开头内容），
+  不再只留一句 `exit code 1`。
+
+### 文档
+
 - README 改为中英双语：英文版在前（面向 GitHub 上的英文读者），中文版在后，
-  顶部提供 `English | 简体中文` 跳转锚点
+  顶部提供 `English | 简体中文` 跳转锚点。补 stdout/stderr 约定说明。
 
 ## v1.1.0 (2026-10-24)
 

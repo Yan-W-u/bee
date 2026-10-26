@@ -301,17 +301,19 @@ def cmd_scan(args: argparse.Namespace) -> int:
             print(f"\n扫描 {len(files)} 个文件，新增 {len(report_findings)} 条"
                   + (f"（另有 {len(known)} 条在基线内）" if baseline_obj else ""))
 
+    # 以下都不走 stdout：`--json` 时 stdout 只能有一个 JSON 文档，
+    # 混入一行提示会让 json.loads 直接报 Extra data（周扫 CI 就挂在这）
     if args.sarif:
         out = sarif.write(report_findings, args.sarif, tool_version=__version__)
-        print(f"SARIF 已写入 {out}")
+        _progress(f"SARIF 已写入 {out}")
 
     if args.output:
         out = write_report(_scan_report(report_findings, target, len(files)), Path(args.output))
-        print(f"报告已写入 {out}")
+        _progress(f"报告已写入 {out}")
 
     if args.write_baseline:
         baseline.save(baseline.build(findings), args.write_baseline)
-        print(f"基线已写入 {args.write_baseline}（{len(findings)} 条）")
+        _progress(f"基线已写入 {args.write_baseline}（{len(findings)} 条）")
 
     if args.fail_on_new and baseline_obj is not None and report_findings:
         _progress(f"存在 {len(report_findings)} 条基线之外的新问题，按 --fail-on-new 返回非零")
@@ -510,15 +512,15 @@ def _emit(args: argparse.Namespace, results: list[RepairResult], target: Path, f
             results, target, files, display_path=getattr(args, "target", None)
         )
         out = write_report(content, Path(args.output))
-        print(f"\n报告已写入 {out}")
+        _progress(f"\n报告已写入 {out}")
 
     if getattr(args, "sarif", None):
         out = sarif.write([r.finding for r in results], args.sarif, tool_version=__version__)
-        print(f"SARIF 已写入 {out}")
+        _progress(f"SARIF 已写入 {out}")
 
     if getattr(args, "write_baseline", None):
         baseline.save(baseline.build([r.finding for r in results]), args.write_baseline)
-        print(f"基线已写入 {args.write_baseline}")
+        _progress(f"基线已写入 {args.write_baseline}")
 
     if getattr(args, "fail_on_findings", False) and any(
         not r.covered_elsewhere for r in results
@@ -544,7 +546,10 @@ def cmd_audit_or_fix(args: argparse.Namespace, do_fix: bool) -> int:
 
     results, files = _make_results(args, target, do_fix)
     if not results:
-        print(f"扫描 {files} 个文件，未发现问题。")
+        # --json 时 stdout 必须是合法 JSON 文档，不能拿中文提示顶替空数组
+        if getattr(args, "json", False):
+            print("[]")
+        _progress(f"扫描 {files} 个文件，未发现问题。")
         return 0
 
     session: PatchSession | None = getattr(args, "_session", None)
@@ -552,25 +557,27 @@ def cmd_audit_or_fix(args: argparse.Namespace, do_fix: bool) -> int:
 
     if do_fix and getattr(args, "apply", False) and session is not None:
         if session.count() == 0:
-            print("没有通过验证的补丁，无需落盘。")
+            _progress("没有通过验证的补丁，无需落盘。")
         else:
             touched = session.files_touched()
-            print(f"\n即将把 {session.count()} 处修改写入 {len(touched)} 个文件：")
+            _progress(f"\n即将把 {session.count()} 处修改写入 {len(touched)} 个文件：")
             for rel in touched:
-                print(f"  - {rel}（{session.count_for(rel)} 处）")
-            print("  每个文件会先生成 .bee.bak 备份，同一文件的修改按验证顺序应用")
+                _progress(f"  - {rel}（{session.count_for(rel)} 处）")
+            _progress("  每个文件会先生成 .bee.bak 备份，同一文件的修改按验证顺序应用")
 
             proceed = True
             if not getattr(args, "yes", False):
-                answer = input("\n确认写入？[y/N] ").strip().lower()
+                # 提示也走 stderr，否则会把 --json 的 stdout 弄脏
+                print("\n确认写入？[y/N] ", end="", file=sys.stderr, flush=True)
+                answer = input().strip().lower()
                 proceed = answer in {"y", "yes"}
             if not proceed:
-                print("已取消落盘。报告中的 diff 仍可手工应用。")
+                _progress("已取消落盘。报告中的 diff 仍可手工应用。")
             else:
                 written, errors = apply_session(root, session)
-                print(f"已写入 {written} 个文件。")
+                _progress(f"已写入 {written} 个文件。")
                 for err in errors:
-                    print(f"  ✗ {err}")
+                    _progress(f"  ✗ {err}")
 
     return _emit(args, results, target, files)
 
