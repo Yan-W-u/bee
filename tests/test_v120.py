@@ -326,12 +326,15 @@ class TestVersionConsistency(unittest.TestCase):
     """版本号两处手写（pyproject + bee/__init__），必须有测试防止漂移。"""
 
     def test_versions_match(self):
-        import tomllib
+        # 不用 tomllib：它是 3.11 才进标准库，而 CI 矩阵跑 3.10
+        import re
 
         import bee
 
-        data = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-        self.assertEqual(data["project"]["version"], bee.__version__,
+        text = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', text)
+        self.assertIsNotNone(m, "pyproject.toml 里找不到 version")
+        self.assertEqual(m.group(1), bee.__version__,
                          "改了 __init__ 忘改 pyproject（或反之），发出去的包版本会错")
 
 
