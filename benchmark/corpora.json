@@ -27,6 +27,7 @@
       "name": "self",
       "path": "${BEE_REPO}",
       "note": "bee 自扫：必须保持 0 新增，否则说明自己的规则打自己",
+      "git_tracked": true,
       "exclude": [
         "samples/**",
         "benchmark/cases/**",

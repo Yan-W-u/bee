@@ -54,6 +54,31 @@ _CONF_ORDER = {Confidence.LOW: 0, Confidence.MEDIUM: 1, Confidence.HIGH: 2}
 _PROFILE_FLOOR = {"strict": Confidence.HIGH, "default": Confidence.MEDIUM, "full": Confidence.LOW}
 
 
+def _merge_rescan_rules(rules: list, args: argparse.Namespace) -> list:
+    """把 --rescan-rules 的规则并进规则集。
+
+    只在 --input 模式下有意义：外部 finding 想验证「漏洞消失」，就得有一条
+    本地规则能重新命中它。规则 id 与外部 rule_id 相同时直接生效；
+    不同时由 aliases 的映射表牵线。
+    """
+    path = getattr(args, "rescan_rules", None)
+    if not path:
+        return rules
+    if not getattr(args, "input", None):
+        _progress("提示：--rescan-rules 只在 --input 模式下有意义，已忽略。")
+        return rules
+    try:
+        extra = load_custom_rules(path)
+    except (OSError, ValueError, ImportError) as exc:
+        _progress(f"读取 --rescan-rules 失败: {exc}")
+        return rules
+    by_id = {r.id: r for r in rules}
+    for r in extra:
+        by_id[r.id] = r
+    _progress(f"重扫规则：合并 {len(extra)} 条自定义规则（{path.name}）")
+    return list(by_id.values())
+
+
 def _select_rules(
     ids: list[str] | None, custom: Path | None, profile: str = "default"
 ) -> list:
@@ -96,6 +121,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="semgrep 规则集，默认 auto（registry），也可传本地规则目录")
         sp.add_argument("--input", type=Path,
                         help="从 SARIF 2.1.0 读取 finding，跳过内置检测，直接进入解释/修复")
+        sp.add_argument("--rescan-rules", type=Path,
+                        help="配合 --input：自定义规则文件，用于重扫验证外部 finding 是否真的消失")
         sp.add_argument("--baseline", type=Path, help="只报告相对该基线新增的问题")
         sp.add_argument("--write-baseline", type=Path, help="把当前结果写成基线文件")
         sp.add_argument("--fail-on-new", action="store_true",
@@ -139,13 +166,18 @@ def _collect_targets(target: Path, include: list[str] | None, exclude: list[str]
     return iter_source_files(target, include, exclude or None)
 
 
-def _warn_if_empty(target: Path, files: list[Path]) -> None:
+def _warn_if_empty(target: Path, files: list[Path], input_mode: bool = False) -> None:
     """扫到 0 个文件时必须说出来。
 
     目标落在 site-packages / node_modules 这类被跳过的目录下时，
     以前的表现是「扫描 0 个文件，无新增问题」——比误报更糟，
     因为使用者会以为项目是干净的。
+
+    `--input` 模式例外：findings 来自外部 SARIF，目标目录里没有可扫文件
+    是完全正常的，此时报警只会误导。
     """
+    if input_mode:
+        return
     if target.is_dir() and not files:
         _progress(
             "警告：扫描到 0 个文件。若目标位于 site-packages / node_modules / vendor 等目录，"
@@ -203,6 +235,7 @@ def _detect_all(
     exclude = getattr(args, "exclude", []) or []
     input_path = getattr(args, "input", None)
     if input_path:
+        from . import aliases
         from .inputs import findings_from_sarif
 
         try:
@@ -210,9 +243,29 @@ def _detect_all(
         except (OSError, ValueError) as exc:
             _progress(f"读取 SARIF 失败: {exc}")
             return [], []
-        return _filter_findings(found, include, exclude, only_paths), [
-            f"外部 SARIF：{input_path.name}（{len(found)} 条，未做本地重扫）"
+
+        # 外部规则不在本地规则表里，默认无法重扫验证。aliases 把能对应的
+        # 映射到内置规则，映射成功的条目才能拿到真正的「漏洞消失」结论。
+        # 映射表（EXPLICIT）是人工核对过的，默认启用；
+        # 按名字猜（heuristic）只在用户显式给了 --rescan-rules 时启用。
+        known = {r.id for r in rules}
+        allow_guess = bool(getattr(args, "rescan_rules", None))
+        mapped, guessed, unmapped = aliases.annotate(found, known, allow_guess=allow_guess)
+
+        notes = [
+            f"外部 SARIF：{input_path.name}（{len(found)} 条）",
         ]
+        if mapped:
+            extra = f"，其中 {guessed} 条为按规则名推测" if guessed else ""
+            notes.append(
+                f"{mapped} 条已映射到本地规则，可验证「漏洞消失」{extra}"
+            )
+        if unmapped:
+            shown = "、".join(unmapped[:3]) + ("…" if len(unmapped) > 3 else "")
+            notes.append(
+                f"{len(found) - mapped} 条无本地等价规则（{shown}）→ 只做解释，不声称已验证"
+            )
+        return _filter_findings(found, include, exclude, only_paths), notes
 
     mode = getattr(args, "detector", "auto")
     config = getattr(args, "semgrep_config", "auto") or "auto"
@@ -255,10 +308,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
         _progress(f"路径不存在: {target}")
         return 2
 
-    rules = _select_rules(args.rule, args.rules_file, getattr(args, "profile", "default"))
+    rules = _merge_rescan_rules(
+        _select_rules(args.rule, args.rules_file, getattr(args, "profile", "default")), args
+    )
     root = target if target.is_dir() else target.parent
     files = _collect_targets(target, args.include, args.exclude)
-    _warn_if_empty(target, files)
+    _warn_if_empty(target, files, input_mode=bool(getattr(args, "input", None)))
     only_paths = None if target.is_dir() else {target.name}
 
     findings, notes = _detect_all(root, rules, args, only_paths=only_paths)
@@ -353,11 +408,13 @@ def _make_results(
     target: Path,
     do_fix: bool,
 ) -> tuple[list[RepairResult], int]:
-    rules = _select_rules(args.rule, args.rules_file, getattr(args, "profile", "default"))
+    rules = _merge_rescan_rules(
+        _select_rules(args.rule, args.rules_file, getattr(args, "profile", "default")), args
+    )
     root = target if target.is_dir() else target.parent
 
     files = _collect_targets(target, args.include, args.exclude)
-    _warn_if_empty(target, files)
+    _warn_if_empty(target, files, input_mode=bool(getattr(args, "input", None)))
     only_paths = None if target.is_dir() else {target.name}
     findings, notes = _detect_all(root, rules, args, only_paths=only_paths)
     for note in notes:
@@ -425,18 +482,22 @@ def _make_results(
 
     results: list[RepairResult] = []
     total = len(findings)
+    # 预算分两个维度判：条数/时间任何模式都生效，调用次数只在真会调模型时生效。
+    # 合成一个判定会让「--no-llm --max-findings 2」静默失效（v1.1.0 的 bug）。
+    llm_active = client is not None and client.config.usable
     for i, f in enumerate(findings, 1):
-        if client is not None and client.config.usable and not budget.allows_more(per_finding_calls):
+        allowed = budget.allows_count() and (not llm_active or budget.allows_llm(per_finding_calls))
+        if not allowed:
+            budget.skip()
             results.append(RepairResult(finding=f, skipped_reason=budget.stopped_reason))
             continue
         _progress(f"[{i}/{total}] {f.location}  {f.message}")
         ctx = build_context(f, root)
         expl = explain(f, ctx, client, root)
-        if client is not None and client.config.usable:
-            budget.charge(per_finding_calls)
+        budget.charge(per_finding_calls if llm_active else 0)
         result = RepairResult(finding=f, explanation=expl)
 
-        if do_fix and client is not None and client.config.usable:
+        if do_fix and llm_active:
             if expl.degraded:
                 # 证据校验不合格的解释不能当「已确认根因」喂给补丁——
                 # 编造的根因会把补丁直接带偏。宁可标成仅解释。
@@ -458,7 +519,6 @@ def _make_results(
                 run_tests=run_tests,
                 session=session,
                 rules=rules,
-                rescan=not bool(getattr(args, "input", None)),
             )
             result.attempts = attempts
             result.accepted = next((a for a in attempts if a.succeeded), None)
@@ -473,7 +533,7 @@ def _make_results(
 
     setattr(args, "_session", session)
     setattr(args, "_budget", budget)
-    if client is not None and client.config.usable:
+    if llm_active:
         from .llm import PROMPT_VERSION
 
         setattr(args, "_llm_meta", {

@@ -29,17 +29,53 @@ def _severity(raw: str | None, rule_level: str | None = None) -> Severity:
     return _LEVEL_SEVERITY.get(text, Severity.WARNING)
 
 
-def _rule_levels(data: dict) -> dict[str, str]:
-    """规则默认 level：有些工具只在 rule 定义里写 level，result 上不写。"""
-    levels: dict[str, str] = {}
+_CWE_RE = re.compile(r"(?i)cwe[-_/ ]?(\d{1,4})")
+_OWASP_RE = re.compile(r"(?i)(?:owasp[-_/ ]?)?(a(\d{1,2}))(?:[:\-])?(\d{4})?")
+
+
+def _norm_cwe(tag: str) -> str:
+    """把 CWE 的各种写法归一到 `CWE-89`。
+
+    Semgrep 写 `CWE-89: Improper Neutralization...`，CodeQL 写
+    `external/cwe/cwe-089`，两条都在 tags 里。归一到 bee 自己的格式，
+    否则 downstream 的 security-severity 和报告都取不到值。
+    """
+    m = _CWE_RE.search(tag)
+    return f"CWE-{int(m.group(1))}" if m else ""
+
+
+def _norm_owasp(tag: str) -> str:
+    m = _OWASP_RE.search(tag)
+    if not m:
+        return ""
+    return f"{m.group(1).upper()}:{m.group(3)}" if m.group(3) else m.group(1).upper()
+
+
+def _rule_meta(data: dict) -> dict[str, dict]:
+    """收集规则级元数据：默认 level、CWE/OWASP 标签、helpUri。
+
+    **CWE 和 OWASP 在规则级**，不在 result 上——Semgrep / CodeQL 都这么放。
+    v1.1.0 只读 `result.properties.cwe`，所以外部 finding 的 cwe/owasp 恒为空，
+    连带 SARIF 重导出时 security-severity 掉回默认值。
+    """
+    meta: dict[str, dict] = {}
     for run in data.get("runs") or []:
-        rules = ((run.get("tool") or {}).get("driver") or {}).get("rules") or []
-        for rule in rules:
+        driver = (run.get("tool") or {}).get("driver") or {}
+        for rule in driver.get("rules") or []:
             rid = rule.get("id")
-            level = ((rule.get("defaultConfiguration") or {}).get("level")) or ""
-            if rid and level:
-                levels[rid] = level
-    return levels
+            if not rid:
+                continue
+            props = rule.get("properties") or {}
+            tags = [str(t) for t in (props.get("tags") or []) if t]
+            cwe = [c for c in (_norm_cwe(t) for t in tags) if c]
+            owasp = [o for o in (_norm_owasp(t) for t in tags) if o]
+            meta[rid] = {
+                "level": ((rule.get("defaultConfiguration") or {}).get("level")) or "",
+                "cwe": cwe,
+                "owasp": owasp,
+                "help": str(rule.get("helpUri") or ""),
+            }
+    return meta
 
 
 def findings_from_sarif(sarif_path: Path, root: Path) -> list[Finding]:
@@ -53,7 +89,7 @@ def findings_from_sarif(sarif_path: Path, root: Path) -> list[Finding]:
     if not isinstance(data, dict) or "runs" not in data:
         raise ValueError(f"不是 SARIF 2.1.0 文件: {sarif_path}")
 
-    levels = _rule_levels(data)
+    meta = _rule_meta(data)
     out: list[Finding] = []
     root_resolved = root.resolve()
 
@@ -87,22 +123,32 @@ def findings_from_sarif(sarif_path: Path, root: Path) -> list[Finding]:
             start = int(region.get("startLine") or 1)
             end = int(region.get("endLine") or start)
             props = res.get("properties") or {}
-            cwe = [str(c) for c in (props.get("cwe") or []) if c]
+            rmeta = meta.get(rid) or {}
+            # result 上写了就用 result 的，没写回退到规则级标签
+            cwe = [str(c) for c in (props.get("cwe") or [])] or list(rmeta.get("cwe") or [])
+            owasp = [str(o) for o in (props.get("owasp") or [])] or list(rmeta.get("owasp") or [])
+            help_uri = str(res.get("helpUri") or rmeta.get("help") or "")
+            refs: list[str] = [help_uri] if help_uri else []
+            for c in cwe:
+                refs.append(f"https://cwe.mitre.org/data/definitions/{c.split('-')[-1]}.html")
 
             out.append(
                 Finding(
                     rule_id=rid,
-                    severity=_severity(res.get("level"), levels.get(rid)),
+                    severity=_severity(res.get("level"), rmeta.get("level")),
                     message=message[:200],
                     path=rel,
                     start_line=start,
                     end_line=max(end, start),
                     cwe=cwe,
-                    owasp=[],
-                    references=[str(res["helpUri"])] if res.get("helpUri") else [],
+                    owasp=owasp,
+                    references=refs,
                     snippet="",
                     code_line="",
                     detector="sarif",
+                    # 外部规则不在本地规则表里：不置 False 的话，
+                    # 重扫扫不到会被当成「已修复」
+                    rescan_ok=False,
                     raw={
                         "title": message[:120],
                         "root_cause_hint": props.get("root_cause_hint") or "",

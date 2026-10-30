@@ -2,7 +2,7 @@
 # PyPI 上 `bee` 已被 2012 年的包占用，发行名用 bee-scanner；
 # 命令行仍然是 `bee`，import 包名也仍然是 bee。
 name = "bee-scanner"
-version = "1.1.0"
+version = "1.2.0"
 description = "漏洞检测 + 可解释性修复 + 机器验证补丁"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -34,3 +34,8 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["bee*"]
+
+[tool.setuptools.package-data]
+# PEP 561：不带这个文件时下游 mypy / pyright 会认为包没有类型信息，
+# 即使 classifier 里写了 Typing :: Typed
+bee = ["py.typed"]

@@ -83,6 +83,28 @@ def rules_for(profile: str) -> list:
     return [r for r in BUILTIN_RULES if _ORDER.get(r.confidence, 1) >= floor]
 
 
+def _git_tracked(repo: Path) -> list[str]:
+    """列出 git 追踪的（相对）文件路径。
+
+    self 语料必须用它：只要本地留了 tmp/、build/、dist/ 这类临时产物，
+    全目录扫描就会把作者自己的草稿算进「自扫误报」，门禁变成看心情红。
+    只用 tracked 文件才是「仓库本身干净」的正确语义。
+    不是 git 仓库（比如下载的 tarball）时返回空列表，由调用方回退到全目录。
+    """
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=repo, capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if out.returncode != 0:
+        return []
+    return [p for p in out.stdout.split("\0") if p]
+
+
 def run_corpus(spec: dict, profile: str = "default") -> dict:
     path = Path(_expand(spec["path"]))
     result = {"name": spec["name"], "path": str(path), "exists": path.exists()}
@@ -90,11 +112,19 @@ def run_corpus(spec: dict, profile: str = "default") -> dict:
         result["error"] = "路径不存在"
         return result
 
+    only_paths = None
+    if spec.get("git_tracked"):
+        tracked = _git_tracked(path)
+        if tracked:
+            only_paths = tracked
+            result["tracked_only"] = len(tracked)
+
     started = time.perf_counter()
     findings: list[Finding] = scan_tree(
         path,
         rules=rules_for(profile),
         include_globs=spec.get("include"),
+        only_paths=only_paths,
         exclude_globs=spec.get("exclude"),
     )
     elapsed = time.perf_counter() - started

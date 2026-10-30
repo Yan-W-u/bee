@@ -1,0 +1,4 @@
+# 这个文件本身是空的，作用是 PEP 561 标记：告诉 mypy / pyright
+# 「bee 包自带类型注解，可以直接用，不要去别处找 stub」。
+# pyproject 里的 `Typing :: Typed` classifier 只是分类标签，
+# 没有这个文件下游依然拿不到类型信息。删任何一个都行，但别只留 classifier。

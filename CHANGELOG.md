@@ -1,8 +1,47 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 (2026-10-30)
+
+外部复核（V1.1-REVIEW）提出的 3 个缺陷、1 个体验问题、2 条主线建议全部落地。
 
 ### 修复
+
+- **`--max-findings` 在没有 API key 时完全不生效**：预算把「处理条数」和「模型调用次数」
+  合成一个判定，无 key 时 `llm_calls` 恒 0 却仍被 `max_llm_calls` 拦住，
+  `--no-llm --max-findings 2` 处理了全部 8 条。现在拆成 `allows_count()` /
+  `allows_llm()`：条数与墙钟任何模式都生效，调用次数只在真会调模型时生效。
+  被截断的条目标「未处理」并写明原因，不再假装没问题。
+- **`Typing :: Typed` 声明了却没有 `bee/py.typed`**：按 PEP 561 补上标记文件与
+  `[tool.setuptools.package-data]`，release 工作流新增断言「wheel 里必须有
+  `bee/py.typed`」，本地没有 setuptools 时也能靠 CI 卡住回归。
+- **外部 SARIF 的 CWE / OWASP / helpUri 全部丢失**：`--input` 只读 `result.properties.cwe`，
+  而 Semgrep / CodeQL 都把标签放在**规则级** `tags`（`CWE-89: …`、`external/cwe/cwe-089`）。
+  现在统一归一到 `CWE-89` / `A03:2021`，并补 CWE 参考链接。此前重导出 SARIF 时
+  `security-severity` 会掉回默认值，GitHub 的优先级排序因此失效。
+- `--input` 模式下目标目录为空时不再误报「扫描到 0 个文件」。
+
+### 新增：外部 finding 的验证闭环
+
+`--input` 曾经有个断链——外部规则 id 在 bee 里不存在，重扫必然扫不到，所以
+`finding_gone` 只能记 `None`，这条产品线永远拿不到「已验证」。
+
+- `bee/aliases.py`：约 50 条人工核对的 Semgrep / CodeQL → 内置规则映射，**默认启用**。
+- `--rescan-rules my_rules.py`：自定义规则 `id` 与外部 `ruleId` 相同时直接用于重扫；
+  与 `--rules-file` 的区别是「追加」而不是「替换」。
+- 映射不上的条目保持 `finding_gone = None`，报告只写「仅解释」，绝不冒充已验证。
+- 按规则名推测（heuristic）只在显式给了 `--rescan-rules` 时启用，且报告里标注。
+
+### 门禁与工程
+
+- `benchmark/expected.json` 的 stdlib 阈值 130 → **100**（实测 77，余量从 65% 收到 30%）：
+  原来的门禁只能抓「整条抑制被删掉」，抓不到渐进放宽。
+- `self` 语料改用 `git ls-files`：本地留了 `tmp/`、`build/` 这类产物时，自扫不再变红。
+- 新增测试 `tests/test_v120.py`（20 条）覆盖上述全部改动；版本号一致性也有测试卡住
+  （`pyproject.toml` 与 `bee/__init__.py` 两处手写）。
+
+测试 143 → **163**，benchmark 16/8 保持 0 FP / 0 FN，真实语料 77 / 18 / 0。
+
+### 修复（v1.1.0 发布后由周扫 CI 暴露）
 
 - **`--json` 的 stdout 被提示信息污染**：`--sarif` / `-o` / `--write-baseline` 写完文件后
   会往 stdout 打「已写入 …」，与 JSON 文档混在一行之外，`json.loads` 直接报

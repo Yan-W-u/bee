@@ -1,10 +1,10 @@
 {
-  "_doc": "阈值。max_findings 按当前实测留出余量：目的是抓「误报回涨」，不是卡死具体数字。",
+  "_doc": "阈值。max_findings 按当前实测留约 30% 余量：目的是抓「误报回涨」，不是卡死具体数字。余量太大的门禁只能抓「整条抑制被删掉」，抓不到渐进放宽。",
   "python-stdlib": {
-    "max_findings": 130,
+    "max_findings": 100,
     "max_seconds": 120,
     "baseline_v1_0_0": 321,
-    "current_v1_1_0": 81
+    "current_v1_1_0": 77
   },
   "site-packages": {
     "max_findings": 400,

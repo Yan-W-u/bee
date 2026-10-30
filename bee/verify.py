@@ -563,12 +563,13 @@ def verify_patch(
     #   和 src/b/models.py 互相覆盖，跨文件补丁的结论就不可信。
     # - 必须传同一个 rules 集合。用默认内置规则重扫自定义规则的 finding，
     #   结果永远是空 → finding_gone 恒真 → 空补丁也能被判「已验证修复」。
-    if not rescan:
-        # 外部 SARIF 的 finding 没有对应的本地规则。用内置规则重扫只会得到
-        # 「空结果 = 已修复」这种假阳性结论，比不验证更危险，所以记为 None。
+    target_rule = finding.rescan_id
+    if not rescan or not finding.rescan_ok or not target_rule:
+        # 没有本地等价规则时，重扫必然空 → 「空 = 已修复」是最危险的假阳性。
+        # 宁可记为 None（未验证），也不给一个查不到的「已验证」。
         attempt.finding_gone = None
         attempt.notes.append(
-            "finding 来自外部 SARIF，本地没有可重扫的同名规则，未做「漏洞消失」验证"
+            "finding 来自外部 SARIF，本地没有可重扫的等价规则，未做「漏洞消失」验证"
         )
     else:
         tmp_scan_dir = Path(tempfile.mkdtemp(prefix="bee-scan-"))
@@ -582,12 +583,16 @@ def verify_patch(
                 probe = tmp_scan_dir / rel
                 remaining.extend(
                     f for f in scan_file(probe, tmp_scan_dir, rules)
-                    if f.rule_id == finding.rule_id
+                    if f.rule_id == target_rule
                 )
             attempt.finding_gone = len(remaining) == 0
             if not attempt.finding_gone:
                 attempt.errors.append(
-                    f"重新扫描仍命中 {finding.rule_id}（{len(remaining)} 处）"
+                    f"重新扫描仍命中 {target_rule}（{len(remaining)} 处）"
+                )
+            if target_rule != finding.rule_id:
+                attempt.notes.append(
+                    f"外部规则 {finding.rule_id} 按 aliases 映射为 {target_rule} 重扫"
                 )
         finally:
             shutil.rmtree(tmp_scan_dir, ignore_errors=True)
@@ -662,7 +667,7 @@ def finding_still_present(
         probe = tmp / finding.path
         probe.parent.mkdir(parents=True, exist_ok=True)
         write_source(probe, base_text)
-        hits = [f for f in scan_file(probe, tmp, rules) if f.rule_id == finding.rule_id]
+        hits = [f for f in scan_file(probe, tmp, rules) if f.rule_id == finding.rescan_id]
         return len(hits) > 0
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

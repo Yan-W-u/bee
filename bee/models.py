@@ -55,7 +55,18 @@ class Finding:
     code_line: str = ""
     detector: str = "bee-rules"
     fingerprint: str = ""
+    # 是否允许用本地规则重扫来验证「漏洞消失」。
+    # 内置检测产生的 finding 天然为 True；`--input` 导入的外部 finding 为 False
+    # ——本地没有等价规则时重扫必然扫不到，把「没扫到」当「修好了」是最危险的
+    # 假阳性。只有 aliases 表映射成功后才会被置回 True。
+    rescan_ok: bool = True
+    # 重扫时实际使用哪条本地规则（映射结果）。空串表示沿用 rule_id。
+    rescan_rule_id: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def rescan_id(self) -> str:
+        return self.rescan_rule_id or self.rule_id
 
     def __post_init__(self) -> None:
         if not self.fingerprint:

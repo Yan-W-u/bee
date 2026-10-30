@@ -282,6 +282,7 @@ else on stdout, while progress lines and "written to ..." notices go to stderr. 
 --limit 10                            process only the first N
 --profile {strict,default,full}       rule tier: strict = high confidence only, full = all heuristics
 --input PATH.sarif                    read findings from external SARIF, skip local detection
+--rescan-rules my_rules.py            with --input: local rules used to verify the fix really landed
 --max-findings 20                     how many findings to process (0 = unlimited)
 --max-llm-calls 120                   upper bound on model calls (estimated)
 --max-seconds 1800                    wall-clock limit
@@ -498,10 +499,13 @@ These are real boundaries. Do not expect otherwise:
     hit by nature. Measuring a real FP rate needs application code with manual labeling,
     which does not exist yet — an explicit gap in v1.1.0. Use `--profile strict` for gates
     and `default` for human reading.
-11. **Findings imported via `--input` cannot be verified as "fixed".** External rules do not
-    exist inside bee, so a rescan would yield a fake "already fixed"; `finding_gone` is
-    therefore `None` and such patches never show as verified. For full verification, add an
-    equivalent custom rule (see [docs/semgrep-integration.md](docs/semgrep-integration.md)).
+11. **`--input` verification only works where a local equivalent exists.** Findings from an
+    external SARIF carry an external rule id, so a rescan would trivially find nothing and
+    report a fake "fixed". bee therefore maps them onto built-in rules first: ~50 curated
+    pairs (Semgrep / CodeQL → `bee.sql-injection` etc.) map automatically, and `--rescan-rules`
+    lets you supply your own rule with a matching id. Whatever cannot be mapped keeps
+    `finding_gone = None` and is reported as "explanation only" — never as verified. The
+    mapping is deliberately conservative: a wrong mapping would invert the verdict.
 12. **Not published to PyPI yet.** The distribution name `bee-scanner` is settled (`bee` was
     taken by a 2012 package), but uploading requires the maintainer to run `twine upload`
     locally. For now, install from the wheel on [Releases](../../releases).
@@ -557,7 +561,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # detection-layer accuracy regression
 ```
 
-143 cases across eleven areas:
+163 cases across twelve areas:
 
 - `tests/test_verify.py` — do the four signals actually block? (including "applies and
   compiles but does not fix", "syntax broken", and sandbox isolation)
@@ -576,6 +580,9 @@ python benchmark/run.py --strict      # detection-layer accuracy regression
   suppression works (parameterized SQL, `shell=False`, `resolve_entities=False`, YAML env-var
   injection, f-string whitelisted table name vs `request.args` user input)
 - `tests/test_inputs.py` — external SARIF import (field mapping, dedup, unverified state)
+- `tests/test_v120.py` — review fixes: `--max-findings` without an API key, PEP 561 marker,
+  corpus threshold headroom, `git ls-files` self-corpus, rule-level CWE/OWASP parsing,
+  and the alias mapping that decides whether an external finding can be verified at all
 - `tests/test_audit_fixes.py` — acceptance scenarios from an external audit: red baseline is
   not misjudged, custom-rule `finding_gone` is not trivially true, `--exclude` `**` semantics,
   fabricated evidence rejected, path traversal and symlinks refused, test-subprocess env
@@ -877,6 +884,7 @@ GitLab SAST 报告消费。
 --limit 10                            只处理前 N 条
 --profile {strict,default,full}       规则档位：strict 只报高把握，full 含全部启发式
 --input PATH.sarif                    从外部 SARIF 读 finding，跳过内置检测
+--rescan-rules my_rules.py            配合 --input：用这些本地规则重扫，验证漏洞真的消失
 --max-findings 20                     最多处理多少条（0=不限）
 --max-llm-calls 120                   模型调用次数上限（估算）
 --max-seconds 1800                    墙钟时间上限
@@ -1075,10 +1083,11 @@ python benchmark/realworld.py --sample 12      # 生成人工标注表
     `eval`/`pickle` 这些危险 API 的实现方，天然会被打中。要测真实 FP 率需要
     **应用代码 + 人工标注**的语料，目前还没有——这是 v1.1.0 明确缺口。规则层
     建议用 `--profile strict` 进门禁，`default` 给人看。
-11. **`--input` 导入的 finding 无法验证「漏洞消失」。** 外部规则不在 bee 内，
-    重扫会得到假的「已修复」，所以 `finding_gone` 记为 `None`，这类补丁永远不会
-    显示「已验证」。要完整验证就补一条等价的自定义规则（见
-    [docs/semgrep-integration.md](docs/semgrep-integration.md)）。
+11. **`--input` 的验证只对「有本地等价规则」的 finding 成立。** 外部 rule_id 在
+    bee 里查不到，硬重扫会得到假的「已修复」。所以先做映射：约 50 条人工核对的
+    Semgrep / CodeQL 规则会自动对应到内置规则；其余可以用 `--rescan-rules` 提供
+    id 相同的自定义规则。映射不上的条目 `finding_gone` 保持 `None`，报告里只写
+    「仅解释」，绝不冒充已验证。映射刻意保守——猜错方向会让结论反着来。
 12. **还没发布到 PyPI。** 发行名 `bee-scanner` 已确定（`bee` 被 2012 年的包占用），
     但上传需要维护者在本机 `twine upload`。当前只能从 [Releases](../../releases)
     下载 wheel 安装。
@@ -1129,7 +1138,7 @@ python -m unittest discover -s tests -v
 python benchmark/run.py --strict      # 检测层准确率回归
 ```
 
-143 个用例覆盖十一块：
+163 个用例覆盖十二块：
 
 - `tests/test_verify.py` —— 四项信号是否真的在拦截（含"能应用能编译但没修好"、
   "语法被改坏"、沙箱隔离三个关键用例）
@@ -1146,6 +1155,9 @@ python benchmark/run.py --strict      # 检测层准确率回归
   （参数化 SQL、`shell=False`、`resolve_entities=False`、YAML 环境变量注入、
   f-string 白名单表名 vs `request.args` 用户输入）
 - `tests/test_inputs.py` —— 外部 SARIF 导入（字段映射、去重、未重扫状态）
+- `tests/test_v120.py` —— 复核修复的验收：无 key 时 `--max-findings` 生效、PEP 561 标记、
+  语料阈值余量、self 用 `git ls-files`、规则级 CWE/OWASP 解析、以及决定
+  「外部 finding 到底能不能验证」的 alias 映射
 - `tests/test_audit_fixes.py` —— 外部审计的验收场景：红基线不误判、自定义规则
   finding_gone 不恒真、`--exclude` 的 `**` 语义、编造证据被打回、路径穿越与
   符号链接被拒绝、测试子进程环境变量剥离、`scan -o` 与 `--fail-on-findings`、

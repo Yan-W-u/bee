@@ -32,6 +32,19 @@ jobs:
             exit "$rc"
           fi
 
+      - name: 校验 wheel 内容
+        run: |
+          # PEP 561：classifier 声明了 Typing :: Typed，wheel 里就必须真的有
+          # py.typed，否则下游 mypy/pyright 依然当这个包没有类型信息。
+          # 这条断言是「声明 = 实现」的机器检查，本地没有 setuptools 时查不了。
+          set +e
+          python -m zipfile -l dist/*.whl > /tmp/whl.txt
+          if ! grep -q 'bee/py.typed' /tmp/whl.txt; then
+            echo "::error title=wheel 缺少 bee/py.typed::PEP 561 标记没打进包，检查 [tool.setuptools.package-data]"
+            exit 1
+          fi
+          echo "py.typed 已在 wheel 中"
+
       - name: 在干净 venv 里验证安装
         run: |
           set +e
