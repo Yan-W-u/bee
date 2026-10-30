@@ -10,8 +10,8 @@ Zero third-party dependencies. Standard library only. Runs directly on Windows /
 
 ```bash
 # Install from the GitHub Release (not on PyPI yet — see Known limitations)
-pipx install https://github.com/Yan-W-u/bee/releases/download/v1.1.0/bee_scanner-1.1.0-py3-none-any.whl
-bee --version                 # bee 1.1.0
+pipx install https://github.com/Yan-W-u/bee/releases/download/v1.2.0/bee_scanner-1.2.0-py3-none-any.whl
+bee --version                 # bee 1.2.0
 bee scan ./your-project       # read-only, pure static analysis
 ```
 
@@ -633,8 +633,8 @@ dependencies: zero.
 
 ```bash
 # 从 Release 安装（PyPI 尚未发布，见「已知限制」）
-pipx install https://github.com/Yan-W-u/bee/releases/download/v1.1.0/bee_scanner-1.1.0-py3-none-any.whl
-bee --version                 # bee 1.1.0
+pipx install https://github.com/Yan-W-u/bee/releases/download/v1.2.0/bee_scanner-1.2.0-py3-none-any.whl
+bee --version                 # bee 1.2.0
 bee scan ./your-project       # 先看有什么，纯静态、只读
 ```
 
